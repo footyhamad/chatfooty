@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -430,6 +431,8 @@ class App:
         ttk.Label(config, text="Output folder").grid(row=2, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(config, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(config, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=6)
+        self.update_btn = ttk.Button(config, text="UPDATE", command=self.update_app)
+        self.update_btn.grid(row=0, column=3, rowspan=3, padx=(14, 6), sticky="ns")
         config.columnconfigure(1, weight=1)
 
         workshop = ttk.LabelFrame(main, text="Workshop queue", padding=8)
@@ -474,6 +477,80 @@ class App:
         self.log_box.configure(yscrollcommand=scroll.set)
         self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
         scroll.pack(side=RIGHT, fill=Y)
+
+    def update_app(self):
+        """Pull the latest main branch and restart the source checkout."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Update", "Stop the current download before updating.")
+            return
+
+        repo_dir = Path(__file__).resolve().parent
+        git_dir = repo_dir / ".git"
+        if not git_dir.is_dir():
+            messagebox.showerror(
+                "Update unavailable",
+                "This copy is not a Git checkout. Run the downloader from the cloned GitHub repository.",
+            )
+            return
+
+        self.save()
+        self.update_btn.configure(state="disabled")
+        self.status_var.set("Checking GitHub for updates…")
+
+        def work():
+            try:
+                check = subprocess.run(
+                    ["git", "-C", str(repo_dir), "fetch", "origin", "main", "--quiet"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=60,
+                )
+                if check.returncode != 0:
+                    raise RuntimeError(check.stderr.strip() or "git fetch failed")
+
+                current = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=20,
+                )
+                remote = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "origin/main"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=20,
+                )
+                if current.returncode != 0 or remote.returncode != 0:
+                    raise RuntimeError("Unable to determine Git revision")
+
+                if current.stdout.strip() == remote.stdout.strip():
+                    self.events.put(("update_result", (True, "Already up to date.")))
+                    return
+
+                pull = subprocess.run(
+                    ["git", "-C", str(repo_dir), "pull", "--ff-only", "origin", "main"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=120,
+                )
+                if pull.returncode != 0:
+                    raise RuntimeError(pull.stderr.strip() or pull.stdout.strip() or "git pull failed")
+
+                self.events.put(("update_result", (True, "Updated. Restarting…")))
+            except FileNotFoundError:
+                self.events.put(("update_result", (False, "Git is not installed or not on PATH.")))
+            except Exception as exc:
+                self.events.put(("update_result", (False, str(exc))))
+
+        self.update_thread = threading.Thread(target=work, daemon=True)
+        self.update_thread.start()
+
+    def restart_after_update(self):
+        self.save()
+        script = Path(__file__).resolve()
+        try:
+            self.root.destroy()
+            subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent))
+        except Exception as exc:
+            messagebox.showerror("Update", f"Updated successfully, but automatic restart failed:\n{exc}")
 
     def browse_steamcmd(self):
         p = filedialog.askopenfilename(filetypes=[("SteamCMD", "steamcmd.exe"), ("Executable", "*.exe")])
@@ -618,6 +695,16 @@ class App:
                 elif kind == "finished":
                     ok, msg = payload
                     self.status_var.set(("DONE: " if ok else "FAILED: ") + str(msg))
+                elif kind == "update_result":
+                    ok, msg = payload
+                    self.update_btn.configure(state="normal")
+                    if ok:
+                        self.status_var.set(str(msg))
+                        if msg.startswith("Updated."):
+                            self.root.after(700, self.restart_after_update)
+                    else:
+                        self.status_var.set("Update failed")
+                        messagebox.showerror("Update", str(msg))
                 elif kind == "all_done":
                     self.start_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
