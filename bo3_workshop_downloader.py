@@ -585,7 +585,16 @@ class App:
     def poll_events(self):
         try:
             while True:
-                kind, payload = self.events.get_nowait()
+                event = self.events.get_nowait()
+
+                # Normalize both the current (kind, payload) format and older
+                # builds that queued (kind, value1, value2, ...) directly.
+                if not isinstance(event, tuple) or len(event) < 2:
+                    self.add_log(f"Internal event ignored: {event!r}")
+                    continue
+                kind = event[0]
+                payload = event[1] if len(event) == 2 else event[1:]
+
                 if kind == "log":
                     self.add_log(str(payload))
                 elif kind == "status":
