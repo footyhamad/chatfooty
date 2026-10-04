@@ -34,7 +34,7 @@ DEFAULTS = {
     "auto_export": True,
 }
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-SUCCESS_RE = re.compile(r"Success\\. Downloaded item (\\d+)", re.I)
+SUCCESS_RE = re.compile(r"Success\. Downloaded item (\d+)", re.I)
 LOGIN_FAIL_RE = re.compile(r"Cached credentials not found|Invalid Password|Login Failure|Not logged on|password:\\s*$", re.I | re.M)
 FAIL_RE = re.compile(r"ERROR!.*(?:Timeout|Failure)|Timeout downloading item|failed \\(Failure\\)", re.I)
 
@@ -210,13 +210,15 @@ class Engine:
                 removed += 1
                 self.emit("log", f"Cleared SteamCMD Workshop data: {p}")
 
-        # Also remove our exported/ported copy for this exact Workshop ID.
-        # This is what the user sees under the configured BO3-Workshop folder.
-        # Only folders ending in [item_id] are touched; unrelated exports remain.
+        # Also remove our exported/ported copies for this exact Workshop ID.
+        # This includes an interrupted ".partial" export from an older run.
+        # Only folders ending in [item_id] or [item_id].partial are touched;
+        # unrelated exports remain untouched.
         if self.out.is_dir():
             suffix = f" [{item_id}]"
+            partial_suffix = f" [{item_id}].partial"
             for p in self.out.iterdir():
-                if p.is_dir() and p.name.endswith(suffix):
+                if p.is_dir() and (p.name.endswith(suffix) or p.name.endswith(partial_suffix)):
                     shutil.rmtree(p)
                     if p.exists():
                         raise RuntimeError(f"Exported Workshop data could not be fully removed: {p}")
@@ -323,13 +325,28 @@ class Engine:
         except OSError:
             pass
 
-    def download(self, item: ItemInfo) -> Path | None:
+    def download(self, item: ItemInfo, *, require_empty_start: bool = False) -> Path | None:
         attempt = 0
         prev_b = max(
             sum_tree_bytes(self.partial_root / item.item_id),
             sum_tree_bytes(self.installed_root / item.item_id),
         )
         prev_t = time.monotonic()
+
+        # A FRESH DOWNLOAD must really begin at zero. Check once before
+        # SteamCMD starts; after that, partial bytes are intentionally kept
+        # so timeout retries can resume safely.
+        if require_empty_start and prev_b != 0:
+            self.emit("finished", (
+                False,
+                "Fresh download refused: old Workshop bytes are still present "
+                f"({human_bytes(prev_b)}). Clear the item again before starting."
+            ))
+            self.emit("log", f"Fresh-start check failed: partial={self.partial_root / item.item_id}")
+            self.emit("log", f"Fresh-start check failed: installed={self.installed_root / item.item_id}")
+            return None
+        if require_empty_start:
+            self.emit("log", "Fresh-start check passed: SteamCMD Workshop byte count is 0 B")
 
         while not self.stop_event.is_set():
             attempt += 1
@@ -469,6 +486,9 @@ class App:
         self.events: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.engine: Engine | None = None
+        # IDs cleared with FRESH DOWNLOAD are tracked until their first launch.
+        # This lets START / RESUME verify that a fresh job really starts at 0 B.
+        self.fresh_ids: set[str] = set()
         self.cfg_path = Path(__file__).with_name("bo3wd.json")
         cfg = {**DEFAULTS, **read_json(self.cfg_path)}
 
@@ -763,7 +783,10 @@ class App:
                     self.events.put(("log", f"Metadata lookup failed for {iid}: {exc}"))
                     info = ItemInfo(iid)
                 self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'}"))
-                self.engine.download(info)
+                is_fresh = iid in self.fresh_ids
+                self.engine.download(info, require_empty_start=is_fresh)
+                # After the first launch, a failed download is resumable by design.
+                self.fresh_ids.discard(iid)
             self.events.put(("all_done", None))
 
         self.worker = threading.Thread(target=work, daemon=True)
@@ -801,11 +824,14 @@ class App:
         )
         try:
             removed = sum(engine.clear_item_data(iid) for iid in ids)
+            self.fresh_ids.update(ids)
             self.bar.configure(value=0)
             self.progress_var.set("0 B / unknown")
             self.speed_var.set("0 B/s")
             self.eta_var.set("ETA --:--")
-            self.status_var.set(f"Fresh-download cleanup complete: removed {removed} old folder(s)")
+            self.status_var.set(
+                f"Fresh-download cleanup complete: removed {removed} old folder(s); start is verified at 0 B"
+            )
         except Exception as exc:
             messagebox.showerror("Clear old data", str(exc))
 
