@@ -472,13 +472,20 @@ class App:
 
         logs = ttk.LabelFrame(main, text="SteamCMD output", padding=5)
         logs.pack(fill=BOTH, expand=True)
-        self.log_box = ttk.Treeview(logs, columns=("line",), show="headings")
+        self.log_box = ttk.Treeview(logs, columns=("line",), show="headings", selectmode="extended")
         self.log_box.heading("line", text="Output")
         self.log_box.column("line", width=900)
+        self.log_box.bind("<Control-c>", self.copy_log)
+        self.log_box.bind("<Control-a>", self.select_all_log)
+        self.log_box.bind("<Button-3>", self.log_context_menu)
         scroll = ttk.Scrollbar(logs, orient="vertical", command=self.log_box.yview)
         self.log_box.configure(yscrollcommand=scroll.set)
         self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
         scroll.pack(side=RIGHT, fill=Y)
+
+        self.log_menu = ttk.Menu(self.root, tearoff=False)
+        self.log_menu.add_command(label="Copy", command=self.copy_log)
+        self.log_menu.add_command(label="Select All", command=self.select_all_log)
 
     def update_app(self):
         """Download the latest source from GitHub and replace this file.
@@ -689,6 +696,32 @@ class App:
         if self.engine:
             self.engine.stop()
         self.status_var.set("Stopping… partial data will be preserved")
+
+    def copy_log(self, _event=None):
+        selected = self.log_box.selection()
+        if not selected:
+            return "break"
+        text = "\n".join(
+            str(self.log_box.item(i, "values")[0])
+            for i in selected
+            if self.log_box.item(i, "values")
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        return "break"
+
+    def select_all_log(self, _event=None):
+        self.log_box.selection_set(self.log_box.get_children())
+        return "break"
+
+    def log_context_menu(self, event):
+        try:
+            row = self.log_box.identify_row(event.y)
+            if row and row not in self.log_box.selection():
+                self.log_box.selection_set(row)
+            self.log_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_menu.grab_release()
 
     def add_log(self, line: str):
         self.log_box.insert("", END, values=(line,))
