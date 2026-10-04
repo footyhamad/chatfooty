@@ -1,2 +1,3 @@
 @echo off
-py "%~dp0bo3_workshop_downloader.py"
+start "" "%SystemRoot%\System32\cmd.exe" /c ""%~dp0launch_hidden.vbs""
+exit /b 0
