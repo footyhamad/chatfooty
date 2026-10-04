@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import queue
@@ -479,18 +481,14 @@ class App:
         scroll.pack(side=RIGHT, fill=Y)
 
     def update_app(self):
-        """Pull the latest main branch and restart the source checkout."""
+        """Download the latest source from GitHub and replace this file.
+        
+        This is deliberately NOT a git operation. It works from a copied source folder
+        as well as from a checkout. Private-repository access uses the authenticated
+        GitHub CLI when available; public repositories can use the raw URL directly.
+        """
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Update", "Stop the current download before updating.")
-            return
-
-        repo_dir = Path(__file__).resolve().parent
-        git_dir = repo_dir / ".git"
-        if not git_dir.is_dir():
-            messagebox.showerror(
-                "Update unavailable",
-                "This copy is not a Git checkout. Run the downloader from the cloned GitHub repository.",
-            )
             return
 
         self.save()
@@ -499,58 +497,99 @@ class App:
 
         def work():
             try:
-                check = subprocess.run(
-                    ["git", "-C", str(repo_dir), "fetch", "origin", "main", "--quiet"],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=60,
-                )
-                if check.returncode != 0:
-                    raise RuntimeError(check.stderr.strip() or "git fetch failed")
+                script = Path(__file__).resolve()
+                current_bytes = script.read_bytes()
+                current_sha = hashlib.sha1(
+                    b"blob " + str(len(current_bytes)).encode() + b"\0" + current_bytes
+                ).hexdigest()
 
-                current = subprocess.run(
-                    ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=20,
-                )
-                remote = subprocess.run(
-                    ["git", "-C", str(repo_dir), "rev-parse", "origin/main"],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=20,
-                )
-                if current.returncode != 0 or remote.returncode != 0:
-                    raise RuntimeError("Unable to determine Git revision")
-
-                if current.stdout.strip() == remote.stdout.strip():
+                remote_bytes, remote_sha = self.fetch_remote_source()
+                if remote_sha == current_sha:
                     self.events.put(("update_result", (True, "Already up to date.")))
                     return
 
-                pull = subprocess.run(
-                    ["git", "-C", str(repo_dir), "pull", "--ff-only", "origin", "main"],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, encoding="utf-8", errors="replace",
-                    timeout=120,
-                )
-                if pull.returncode != 0:
-                    raise RuntimeError(pull.stderr.strip() or pull.stdout.strip() or "git pull failed")
+                if not remote_bytes.strip().startswith(b"#!"):
+                    raise RuntimeError("GitHub returned unexpected data; update aborted")
 
-                self.events.put(("update_result", (True, "Updated. Restarting…")))
-            except FileNotFoundError:
-                self.events.put(("update_result", (False, "Git is not installed or not on PATH.")))
+                temp = script.with_suffix(script.suffix + ".update")
+                temp.write_bytes(remote_bytes)
+                self.events.put(("update_ready", str(temp)))
             except Exception as exc:
                 self.events.put(("update_result", (False, str(exc))))
 
         self.update_thread = threading.Thread(target=work, daemon=True)
         self.update_thread.start()
 
-    def restart_after_update(self):
+    def fetch_remote_source(self) -> tuple[bytes, str]:
+        """Fetch bo3_workshop_downloader.py from the main branch without requiring Git."""
+        raw_url = "https://raw.githubusercontent.com/footyhamad/chatfooty/main/bo3_workshop_downloader.py"
+        try:
+            req = urllib.request.Request(
+                raw_url,
+                headers={"User-Agent": "BO3-Workshop-Downloader-Updater/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = response.read()
+            sha = hashlib.sha1(
+                b"blob " + str(len(data)).encode() + b"\0" + data
+            ).hexdigest()
+            return data, sha
+        except Exception:
+            # The repository is private in the normal setup, so use an already
+            # authenticated GitHub CLI session as the fallback.
+            try:
+                proc = subprocess.run(
+                    [
+                        "gh", "api",
+                        "repos/footyhamad/chatfooty/contents/bo3_workshop_downloader.py",
+                        "--method", "GET",
+                        "--field", "ref=main",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "GitHub update requires either a public repo or GitHub CLI (gh) "
+                    "authenticated to the repo."
+                ) from exc
+            if proc.returncode != 0:
+                detail = proc.stderr.decode("utf-8", "replace").strip()
+                raise RuntimeError("GitHub API update failed: " + (detail or "unknown error"))
+
+            payload = json.loads(proc.stdout.decode("utf-8"))
+            data = base64.b64decode(payload["content"])
+            remote_sha = payload.get("sha", "")
+            if not remote_sha:
+                remote_sha = hashlib.sha1(
+                    b"blob " + str(len(data)).encode() + b"\0" + data
+                ).hexdigest()
+            return data, remote_sha
+
+    def restart_after_update(self, temp_path: str):
         self.save()
         script = Path(__file__).resolve()
+        temp = Path(temp_path)
+        helper = script.with_name(".bo3wd_apply_update.cmd")
+        py = str(Path(sys.executable).resolve())
+        bat = (
+            "@echo off\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            f'move /Y "{temp}" "{script}" >nul\r\n'
+            f'start "" "{py}" "{script}"\r\n'
+            'del "%~f0"\r\n'
+        )
         try:
+            helper.write_text(bat, encoding="utf-8")
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", str(helper)],
+                cwd=str(script.parent),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
             self.root.destroy()
-            subprocess.Popen([sys.executable, str(script)], cwd=str(script.parent))
         except Exception as exc:
-            messagebox.showerror("Update", f"Updated successfully, but automatic restart failed:\n{exc}")
+            messagebox.showerror("Update", f"Updated download was prepared, but restart failed:\n{exc}")
 
     def browse_steamcmd(self):
         p = filedialog.askopenfilename(filetypes=[("SteamCMD", "steamcmd.exe"), ("Executable", "*.exe")])
@@ -695,15 +734,15 @@ class App:
                 elif kind == "finished":
                     ok, msg = payload
                     self.status_var.set(("DONE: " if ok else "FAILED: ") + str(msg))
+                elif kind == "update_ready":
+                    self.status_var.set("Update downloaded. Restarting…")
+                    self.update_btn.configure(state="disabled")
+                    self.root.after(700, lambda p=payload: self.restart_after_update(p))
                 elif kind == "update_result":
                     ok, msg = payload
                     self.update_btn.configure(state="normal")
-                    if ok:
-                        self.status_var.set(str(msg))
-                        if msg.startswith("Updated."):
-                            self.root.after(700, self.restart_after_update)
-                    else:
-                        self.status_var.set("Update failed")
+                    self.status_var.set(str(msg) if ok else "Update failed")
+                    if not ok:
                         messagebox.showerror("Update", str(msg))
                 elif kind == "all_done":
                     self.start_btn.configure(state="normal")
