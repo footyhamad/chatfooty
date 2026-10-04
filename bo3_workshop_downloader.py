@@ -197,15 +197,32 @@ class Engine:
         self.stop_event.set()
 
     def clear_item_data(self, item_id: str) -> int:
-        # Clear only SteamCMD's cached data for this Workshop ID.
-        # The user's exported BO3-Workshop folder is deliberately untouched.
+        # A Workshop download has two SteamCMD-side locations: the partial
+        # download cache and the installed Workshop copy. Clear BOTH so
+        # SteamCMD cannot silently resume the old bytes.
         removed = 0
         for root in (self.partial_root, self.installed_root):
             p = root / item_id
             if p.exists():
                 shutil.rmtree(p)
+                if p.exists():
+                    raise RuntimeError(f"SteamCMD data could not be fully removed: {p}")
                 removed += 1
-                self.emit("log", f"Cleared old Workshop data: {p}")
+                self.emit("log", f"Cleared SteamCMD Workshop data: {p}")
+
+        # Also remove our exported/ported copy for this exact Workshop ID.
+        # This is what the user sees under the configured BO3-Workshop folder.
+        # Only folders ending in [item_id] are touched; unrelated exports remain.
+        if self.out.is_dir():
+            suffix = f" [{item_id}]"
+            for p in self.out.iterdir():
+                if p.is_dir() and p.name.endswith(suffix):
+                    shutil.rmtree(p)
+                    if p.exists():
+                        raise RuntimeError(f"Exported Workshop data could not be fully removed: {p}")
+                    removed += 1
+                    self.emit("log", f"Cleared old exported/ported copy: {p}")
+
         return removed
 
     def _cmd(self, item_id: str) -> list[str]:
@@ -501,7 +518,7 @@ class App:
         ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
         self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
         self.start_btn.grid(row=1, column=1, sticky="w", padx=6, pady=5)
-        self.clear_btn = ttk.Button(workshop, text="CLEAR OLD DATA", command=self.clear_old_data)
+        self.clear_btn = ttk.Button(workshop, text="FRESH DOWNLOAD", command=self.clear_old_data)
         self.clear_btn.grid(row=1, column=2, padx=6, pady=5)
         self.stop_btn = ttk.Button(workshop, text="STOP", command=self.stop, state="disabled")
         self.stop_btn.grid(row=1, column=1, sticky="e", padx=6, pady=5)
@@ -763,8 +780,8 @@ class App:
             return
         if not messagebox.askyesno(
             "Clear old data",
-            "Delete SteamCMD partial/installed data for:\n\n" + ", ".join(ids) +
-            "\n\nYour exported BO3-Workshop folder will NOT be touched.",
+            "Delete ALL old download data for:\n\n" + ", ".join(ids) +
+            "\n\nThis removes SteamCMD partial/installed data AND exported/ported copies for these IDs.",
             icon="warning",
         ):
             return
@@ -788,7 +805,7 @@ class App:
             self.progress_var.set("0 B / unknown")
             self.speed_var.set("0 B/s")
             self.eta_var.set("ETA --:--")
-            self.status_var.set(f"Cleared {removed} old Workshop folder(s)")
+            self.status_var.set(f"Fresh-download cleanup complete: removed {removed} old folder(s)")
         except Exception as exc:
             messagebox.showerror("Clear old data", str(exc))
 
