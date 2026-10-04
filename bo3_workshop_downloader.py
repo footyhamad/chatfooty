@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""BO3 Workshop Downloader: a resilient SteamCMD wrapper for BO3 Workshop items."""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, filedialog, messagebox
+from tkinter import ttk
+
+APP_ID = "311210"
+STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+DEFAULTS = {
+    "steamcmd": "",
+    "steam_user": "",
+    "output_dir": "BO3-Workshop",
+    "max_retries": 0,
+    "watchdog_seconds": 420,
+    "poll_seconds": 2.0,
+    "auto_export": True,
+}
+ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+SUCCESS_RE = re.compile(r"Success\\. Downloaded item (\\d+)", re.I)
+LOGIN_FAIL_RE = re.compile(r"Cached credentials not found|Invalid Password|Login Failure|Not logged on|password:\\s*$", re.I | re.M)
+FAIL_RE = re.compile(r"ERROR!.*(?:Timeout|Failure)|Timeout downloading item|failed \\(Failure\\)", re.I)
+
+
+def human_bytes(n: int | float) -> str:
+    n = max(0.0, float(n))
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024
+        i += 1
+    return f"{n:.1f} {units[i]}" if i else f"{int(n)} B"
+
+
+def human_speed(n: float) -> str:
+    return human_bytes(n) + "/s"
+
+
+def eta_text(seconds: float | None) -> str:
+    if seconds is None or seconds < 0 or seconds > 7 * 86400:
+        return "--:--"
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def sum_tree_bytes(root: Path) -> int:
+    total = 0
+    if not root.is_dir():
+        return 0
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += (Path(base) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def detect_steam_user(steamcmd: Path) -> str:
+    cfg = steamcmd.parent / "config" / "config.vdf"
+    if not cfg.exists():
+        return ""
+    txt = cfg.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'"Accounts"\s*\{\s*"([^"]+)"', txt)
+    return m.group(1) if m else ""
+
+
+def find_steamcmd() -> Path | None:
+    candidates = [Path(f"{d}:\\scmd\\steamcmd.exe") for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+    candidates += [
+        Path(r"C:\steamcmd\steamcmd.exe"),
+        Path(r"D:\steamcmd\steamcmd.exe"),
+        Path(r"C:\Program Files (x86)\SteamCMD\steamcmd.exe"),
+        Path(r"C:\Program Files\SteamCMD\steamcmd.exe"),
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
+@dataclass
+class ItemInfo:
+    item_id: str
+    title: str = ""
+    size: int = 0
+    app: str = ""
+
+
+class WorkshopAPI:
+    @staticmethod
+    def get(item_id: str) -> ItemInfo:
+        body = urllib.parse.urlencode({
+            "itemcount": "1",
+            "publishedfileids[0]": item_id,
+        }).encode()
+        req = urllib.request.Request(
+            STEAM_API,
+            data=body,
+            headers={"User-Agent": "BO3-Workshop-Downloader/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            data = json.load(response)
+        entry = data["response"]["publishedfiledetails"][0]
+        if str(entry.get("result", "1")) != "1":
+            raise RuntimeError(f"Steam returned result {entry.get('result')}")
+        return ItemInfo(
+            item_id=item_id,
+            title=entry.get("title", "") or "",
+            size=int(entry.get("file_size", 0) or 0),
+            app=str(entry.get("consumer_app_id", "") or ""),
+        )
+
+
+class Engine:
+    def __init__(self, steamcmd: Path, user: str, out: Path, *,
+                 retries: int, watchdog: int, poll: float, auto_export: bool, emit):
+        self.steamcmd = steamcmd
+        self.user = user
+        self.out = out
+        self.max_retries = max(0, retries)
+        self.watchdog = max(120, watchdog)
+        self.poll = max(0.5, poll)
+        self.auto_export = auto_export
+        self.emit = emit
+        self.stop_event = threading.Event()
+        root = steamcmd.parent
+        self.partial_root = root / "steamapps" / "workshop" / "downloads" / APP_ID
+        self.installed_root = root / "steamapps" / "workshop" / "content" / APP_ID
+        self.log_root = out / "_logs"
+
+    def stop(self):
+        self.stop_event.set()
+
+    def clear_partial(self, item_id: str) -> None:
+        p = self.partial_root / item_id
+        if p.exists():
+            shutil.rmtree(p)
+        self.emit("log", f"Cleared partial download: {p}")
+
+    def _cmd(self, item_id: str) -> list[str]:
+        return [
+            str(self.steamcmd),
+            "+login", self.user,
+            "+workshop_download_item", APP_ID, item_id,
+            "validate", "+quit",
+        ]
+
+    def _log(self, item_id: str, line: str):
+        self.log_root.mkdir(parents=True, exist_ok=True)
+        with (self.log_root / f"{item_id}.log").open("a", encoding="utf-8", errors="replace") as f:
+            f.write(line.rstrip() + "\n")
+
+    def _progress(self, item: ItemInfo, attempt: int, started: float, prev_b: int, prev_t: float):
+        partial = self.partial_root / item.item_id
+        installed = self.installed_root / item.item_id
+        current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
+        now = time.monotonic()
+        db = current - prev_b
+        dt = max(0.05, now - prev_t)
+        speed = max(0.0, db / dt)
+        pct = (current / item.size * 100.0) if item.size else None
+        eta = ((item.size - current) / speed) if item.size and speed > 0 else None
+        self.emit("progress", {
+            "bytes": current,
+            "total": item.size,
+            "pct": pct,
+            "speed": speed,
+            "eta": eta,
+            "attempt": attempt,
+            "elapsed": now - started,
+        })
+        return current, now
+
+    def export(self, item: ItemInfo) -> Path:
+        src = self.installed_root / item.item_id
+        if not src.is_dir():
+            raise RuntimeError("SteamCMD reported success but the installed Workshop directory is missing")
+        safe = re.sub(r'[^A-Za-z0-9._ -]+', "_", item.title or item.item_id).strip(" .") or item.item_id
+        dest = self.out / f"{safe} [{item.item_id}]"
+        tmp = self.out / f".{safe} [{item.item_id}].partial"
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.out.mkdir(parents=True, exist_ok=True)
+        entries: list[tuple[Path, Path, int]] = []
+        total = 0
+        for base, _dirs, names in os.walk(src):
+            for name in names:
+                src_file = Path(base) / name
+                try:
+                    size = src_file.stat().st_size
+                except OSError:
+                    continue
+                total += size
+                entries.append((src_file, src_file.relative_to(src), size))
+        copied = 0
+        for src_file, rel, size in entries:
+            if self.stop_event.is_set():
+                raise RuntimeError("Stopped during export")
+            dst = tmp / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst)
+            copied += size
+            self.emit("export_progress", (copied, total, dest.name))
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        tmp.replace(dest)
+        return dest
+
+    def _kill(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                )
+            else:
+                proc.kill()
+        except OSError:
+            pass
+
+    def download(self, item: ItemInfo) -> Path | None:
+        attempt = 0
+        prev_b = max(
+            sum_tree_bytes(self.partial_root / item.item_id),
+            sum_tree_bytes(self.installed_root / item.item_id),
+        )
+        prev_t = time.monotonic()
+
+        while not self.stop_event.is_set():
+            attempt += 1
+            if self.max_retries and attempt > self.max_retries:
+                self.emit("finished", (False, f"Retry limit reached: {self.max_retries}"))
+                return None
+
+            partial = self.partial_root / item.item_id
+            self.emit("status", f"Attempt {attempt}: " +
+                      ("resuming existing partial data" if partial.exists() else "starting"))
+            self._log(item.item_id, f"\\n=== attempt {attempt} ===")
+            self._log(item.item_id, "$ steamcmd +login *** +workshop_download_item 311210 " + item.item_id + " validate +quit")
+
+            proc = subprocess.Popen(
+                self._cmd(item.item_id),
+                cwd=str(self.steamcmd.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+
+            start = time.monotonic()
+            output: list[str] = []
+            q: queue.Queue[str | None] = queue.Queue()
+
+            def reader():
+                try:
+                    if proc.stdout:
+                        for line in proc.stdout:
+                            q.put(line)
+                finally:
+                    q.put(None)
+
+            threading.Thread(target=reader, daemon=True).start()
+            last_scan = 0.0
+            killed = False
+
+            while proc.poll() is None and not self.stop_event.is_set():
+                while True:
+                    try:
+                        line = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        break
+                    clean = ANSI_RE.sub("", line.rstrip())
+                    output.append(clean)
+                    self._log(item.item_id, clean)
+                    self.emit("log", clean)
+
+                now = time.monotonic()
+                if now - start >= self.watchdog:
+                    killed = True
+                    self._kill(proc)
+                    self.emit("status", f"Watchdog hit {self.watchdog}s — restarting; partial data is preserved")
+                    self._log(item.item_id, f"WATCHDOG KILL after {self.watchdog}s")
+                    break
+
+                if now - last_scan >= self.poll:
+                    prev_b, prev_t = self._progress(item, attempt, start, prev_b, prev_t)
+                    last_scan = now
+                time.sleep(0.05)
+
+            if self.stop_event.is_set():
+                self._kill(proc)
+                self.emit("finished", (False, "Stopped; partial Workshop data was preserved"))
+                return None
+
+            try:
+                if proc.stdout:
+                    for line in proc.stdout:
+                        clean = ANSI_RE.sub("", line.rstrip())
+                        output.append(clean)
+                        self._log(item.item_id, clean)
+                        self.emit("log", clean)
+            except Exception:
+                pass
+
+            text = "\n".join(output)
+            final_b = max(
+                sum_tree_bytes(self.partial_root / item.item_id),
+                sum_tree_bytes(self.installed_root / item.item_id),
+            )
+            self.emit("progress", {
+                "bytes": final_b,
+                "total": item.size,
+                "pct": min(100.0, final_b / item.size * 100.0) if item.size else None,
+                "speed": 0.0,
+                "eta": 0,
+                "attempt": attempt,
+                "elapsed": time.monotonic() - start,
+            })
+
+            if SUCCESS_RE.search(text):
+                installed = self.installed_root / item.item_id
+                try:
+                    exported = self.export(item) if self.auto_export else installed
+                    self.emit("finished", (True, f"Completed → {exported}"))
+                    return installed
+                except Exception as exc:
+                    self.emit("finished", (False, f"Download finished, export failed: {exc}"))
+                    return installed
+
+            if LOGIN_FAIL_RE.search(text):
+                self.emit("finished", (False, "SteamCMD login failed. Log in once manually with this SteamCMD install."))
+                return None
+
+            if killed or FAIL_RE.search(text) or proc.returncode not in (0, None):
+                got = max(
+                    sum_tree_bytes(self.partial_root / item.item_id),
+                    sum_tree_bytes(self.installed_root / item.item_id),
+                )
+                self.emit("status", f"SteamCMD failed/timed out at {human_bytes(got)} — retrying without deleting data")
+                prev_b = got
+                prev_t = time.monotonic()
+                continue
+
+            self.emit("status", "SteamCMD exited without a success marker — retrying")
+            prev_b = final_b
+            prev_t = time.monotonic()
+
+        self.emit("finished", (False, "Stopped"))
+        return None
+
+
+class App:
+    def __init__(self, root: Tk):
+        self.root = root
+        self.root.title("BO3 Workshop Downloader")
+        self.root.geometry("1020x760")
+        self.root.minsize(900, 650)
+        self.events: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
+        self.engine: Engine | None = None
+        self.cfg_path = Path(__file__).with_name("bo3wd.json")
+        cfg = {**DEFAULTS, **read_json(self.cfg_path)}
+
+        detected = find_steamcmd()
+        self.steamcmd_var = StringVar(value=cfg["steamcmd"] or (str(detected) if detected else ""))
+        user = cfg["steam_user"] or (detect_steam_user(Path(self.steamcmd_var.get())) if self.steamcmd_var.get() else "")
+        self.user_var = StringVar(value=user)
+        self.output_var = StringVar(value=cfg["output_dir"])
+        self.ids_var = StringVar(value="3296316642")
+        self.retry_var = StringVar(value=str(cfg["max_retries"]))
+        self.watchdog_var = StringVar(value=str(cfg["watchdog_seconds"]))
+        self.auto_export_var = BooleanVar(value=bool(cfg["auto_export"]))
+
+        self.status_var = StringVar(value="Ready")
+        self.progress_var = StringVar(value="0 B / unknown")
+        self.speed_var = StringVar(value="0 B/s")
+        self.eta_var = StringVar(value="ETA --:--")
+        self.attempt_var = StringVar(value="Attempt 0")
+        self.info_var = StringVar(value="")
+
+        self.build_ui()
+        self.root.after(100, self.poll_events)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def build_ui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill=BOTH, expand=True)
+
+        config = ttk.LabelFrame(main, text="SteamCMD", padding=8)
+        config.pack(fill=X)
+        ttk.Label(config, text="steamcmd.exe").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(config, textvariable=self.steamcmd_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Button(config, text="Browse", command=self.browse_steamcmd).grid(row=0, column=2, padx=6)
+        ttk.Label(config, text="Steam account").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(config, textvariable=self.user_var).grid(row=1, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Label(config, text="Output folder").grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(config, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Button(config, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=6)
+        config.columnconfigure(1, weight=1)
+
+        workshop = ttk.LabelFrame(main, text="Workshop queue", padding=8)
+        workshop.pack(fill=X, pady=(10, 0))
+        ttk.Label(workshop, text="IDs (space/comma separated)").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(workshop, textvariable=self.ids_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
+        ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
+        self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
+        self.start_btn.grid(row=1, column=1, sticky="w", padx=6, pady=5)
+        self.stop_btn = ttk.Button(workshop, text="STOP", command=self.stop, state="disabled")
+        self.stop_btn.grid(row=1, column=1, sticky="e", padx=6, pady=5)
+        ttk.Label(workshop, textvariable=self.info_var).grid(row=2, column=1, sticky="w", padx=6, pady=5)
+        workshop.columnconfigure(1, weight=1)
+
+        opts = ttk.Frame(main)
+        opts.pack(fill=X, pady=(8, 0))
+        ttk.Label(opts, text="Max retries (0 = infinite)").pack(side=LEFT, padx=5)
+        ttk.Entry(opts, textvariable=self.retry_var, width=7).pack(side=LEFT)
+        ttk.Label(opts, text="Watchdog (sec)").pack(side=LEFT, padx=(18, 5))
+        ttk.Entry(opts, textvariable=self.watchdog_var, width=7).pack(side=LEFT)
+        ttk.Checkbutton(opts, text="Export completed item", variable=self.auto_export_var).pack(side=LEFT, padx=18)
+
+        progress = ttk.LabelFrame(main, text="Real progress", padding=10)
+        progress.pack(fill=X, pady=(10, 0))
+        self.bar = ttk.Progressbar(progress, maximum=100, mode="determinate")
+        self.bar.pack(fill=X, pady=(0, 8))
+        row = ttk.Frame(progress)
+        row.pack(fill=X)
+        ttk.Label(row, textvariable=self.progress_var, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
+        ttk.Label(row, textvariable=self.speed_var).pack(side=LEFT, padx=25)
+        ttk.Label(row, textvariable=self.eta_var).pack(side=LEFT, padx=25)
+        ttk.Label(row, textvariable=self.attempt_var).pack(side=RIGHT)
+
+        ttk.Label(main, textvariable=self.status_var).pack(fill=X, pady=(8, 4))
+
+        logs = ttk.LabelFrame(main, text="SteamCMD output", padding=5)
+        logs.pack(fill=BOTH, expand=True)
+        self.log_box = ttk.Treeview(logs, columns=("line",), show="headings")
+        self.log_box.heading("line", text="Output")
+        self.log_box.column("line", width=900)
+        scroll = ttk.Scrollbar(logs, orient="vertical", command=self.log_box.yview)
+        self.log_box.configure(yscrollcommand=scroll.set)
+        self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll.pack(side=RIGHT, fill=Y)
+
+    def browse_steamcmd(self):
+        p = filedialog.askopenfilename(filetypes=[("SteamCMD", "steamcmd.exe"), ("Executable", "*.exe")])
+        if p:
+            self.steamcmd_var.set(p)
+            if not self.user_var.get():
+                self.user_var.set(detect_steam_user(Path(p)))
+
+    def browse_output(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.output_var.set(p)
+
+    def ids(self) -> list[str]:
+        return list(dict.fromkeys(x for x in re.split(r"[\s,;]+", self.ids_var.get()) if x.isdigit()))
+
+    def save(self):
+        write_json(self.cfg_path, {
+            "steamcmd": self.steamcmd_var.get().strip(),
+            "steam_user": self.user_var.get().strip(),
+            "output_dir": self.output_var.get().strip(),
+            "max_retries": int(self.retry_var.get() or 0),
+            "watchdog_seconds": int(self.watchdog_var.get() or 420),
+            "poll_seconds": 2.0,
+            "auto_export": bool(self.auto_export_var.get()),
+        })
+
+    def lookup(self):
+        ids = self.ids()
+        if not ids:
+            messagebox.showerror("Workshop", "Enter a numeric Workshop ID.")
+            return
+        def work():
+            for iid in ids:
+                try:
+                    info = WorkshopAPI.get(iid)
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                except Exception as exc:
+                    self.events.put(("log", f"Lookup {iid} failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+        user = self.user_var.get().strip() or detect_steam_user(steamcmd)
+        out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
+        ids = self.ids()
+        if not steamcmd.is_file():
+            messagebox.showerror("SteamCMD", "Select the SteamCMD executable.")
+            return
+        if not user:
+            messagebox.showerror("Steam login", "No cached login found. Log in once manually with this SteamCMD install.")
+            return
+        if not ids:
+            messagebox.showerror("Workshop", "Enter at least one numeric Workshop ID.")
+            return
+        try:
+            retries = int(self.retry_var.get())
+            watchdog = int(self.watchdog_var.get())
+        except ValueError:
+            messagebox.showerror("Settings", "Retries and watchdog must be integers.")
+            return
+
+        self.save()
+        self.log_box.delete(*self.log_box.get_children())
+        self.bar.configure(value=0)
+        self.status_var.set("Preparing…")
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        self.engine = Engine(
+            steamcmd, user, out,
+            retries=retries, watchdog=watchdog,
+            poll=2.0, auto_export=self.auto_export_var.get(),
+            emit=self.events.put,
+        )
+
+        def work():
+            for iid in ids:
+                if self.engine.stop_event.is_set():
+                    break
+                try:
+                    info = WorkshopAPI.get(iid)
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                except Exception as exc:
+                    self.events.put(("log", f"Metadata lookup failed for {iid}: {exc}"))
+                    info = ItemInfo(iid)
+                self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'}"))
+                self.engine.download(info)
+            self.events.put(("all_done", None))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def stop(self):
+        if self.engine:
+            self.engine.stop()
+        self.status_var.set("Stopping… partial data will be preserved")
+
+    def add_log(self, line: str):
+        self.log_box.insert("", END, values=(line,))
+        items = self.log_box.get_children()
+        if items:
+            self.log_box.see(items[-1])
+        if len(items) > 2000:
+            self.log_box.delete(items[0])
+
+    def poll_events(self):
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self.add_log(str(payload))
+                elif kind == "status":
+                    self.status_var.set(str(payload))
+                elif kind == "info":
+                    self.info_var.set(str(payload))
+                elif kind == "progress":
+                    p = payload
+                    self.bar.configure(value=min(100.0, max(0.0, p["pct"] or 0)))
+                    total = human_bytes(p["total"]) if p["total"] else "unknown"
+                    pct = f" ({p['pct']:.2f}%)" if p["pct"] is not None else ""
+                    self.progress_var.set(f"{human_bytes(p['bytes'])} / {total}{pct}")
+                    self.speed_var.set(human_speed(p["speed"]))
+                    self.eta_var.set("ETA " + eta_text(p["eta"]))
+                    self.attempt_var.set(f"Attempt {p['attempt']}")
+                elif kind == "export_progress":
+                    b, t, name = payload
+                    self.bar.configure(value=(b / t * 100.0) if t else 0)
+                    self.progress_var.set(f"Export {human_bytes(b)} / {human_bytes(t)}")
+                    self.status_var.set(f"Exporting {name}")
+                elif kind == "finished":
+                    ok, msg = payload
+                    self.status_var.set(("DONE: " if ok else "FAILED: ") + str(msg))
+                elif kind == "all_done":
+                    self.start_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    if self.status_var.get().startswith("Preparing") or self.status_var.get().startswith("Downloading"):
+                        self.status_var.set("Queue finished")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_events)
+
+    def close(self):
+        if self.engine:
+            self.engine.stop()
+        try:
+            self.save()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+def main():
+    root = Tk()
+    try:
+        ttk.Style().theme_use("vista")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
