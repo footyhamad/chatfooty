@@ -117,6 +117,35 @@ class ItemInfo:
 
 class WorkshopAPI:
     @staticmethod
+    def _page_size(item_id: str) -> int:
+        # Steam's API can report file_size=0; use the public Workshop page as a fallback.
+        url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={item_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            html = response.read().decode("utf-8", "replace")
+        match = re.search(
+            r"detailsStatLeft[^>]*>\s*File Size\s*</div>.*?"
+            r"detailsStatRight[^>]*>\s*([^<]+)",
+            html,
+            re.I | re.S,
+        )
+        if not match:
+            return 0
+        text = re.sub(r"\s+", " ", match.group(1)).strip().replace(",", "")
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)", text, re.I)
+        if not match:
+            return 0
+        value = float(match.group(1))
+        multiplier = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}[match.group(2).upper()]
+        return int(value * multiplier)
+
+    @staticmethod
     def get(item_id: str) -> ItemInfo:
         body = urllib.parse.urlencode({
             "itemcount": "1",
@@ -132,10 +161,17 @@ class WorkshopAPI:
         entry = data["response"]["publishedfiledetails"][0]
         if str(entry.get("result", "1")) != "1":
             raise RuntimeError(f"Steam returned result {entry.get('result')}")
+        size = int(entry.get("file_size", 0) or 0)
+        if not size:
+            try:
+                size = WorkshopAPI._page_size(item_id)
+            except Exception:
+                pass
+
         return ItemInfo(
             item_id=item_id,
             title=entry.get("title", "") or "",
-            size=int(entry.get("file_size", 0) or 0),
+            size=size,
             app=str(entry.get("consumer_app_id", "") or ""),
         )
 
@@ -160,11 +196,17 @@ class Engine:
     def stop(self):
         self.stop_event.set()
 
-    def clear_partial(self, item_id: str) -> None:
-        p = self.partial_root / item_id
-        if p.exists():
-            shutil.rmtree(p)
-        self.emit("log", f"Cleared partial download: {p}")
+    def clear_item_data(self, item_id: str) -> int:
+        # Clear only SteamCMD's cached data for this Workshop ID.
+        # The user's exported BO3-Workshop folder is deliberately untouched.
+        removed = 0
+        for root in (self.partial_root, self.installed_root):
+            p = root / item_id
+            if p.exists():
+                shutil.rmtree(p)
+                removed += 1
+                self.emit("log", f"Cleared old Workshop data: {p}")
+        return removed
 
     def _cmd(self, item_id: str) -> list[str]:
         return [
@@ -184,9 +226,23 @@ class Engine:
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
         now = time.monotonic()
-        db = current - prev_b
-        dt = max(0.05, now - prev_t)
-        speed = max(0.0, db / dt)
+        dt = max(0.5, now - prev_t)
+        db = max(0, current - prev_b)
+
+        # File sizes change in bursts because SteamCMD writes/flushes chunks.
+        # A single 2-second delta therefore produces misleading 0 B/s readings.
+        # Use a rolling window so the displayed speed stays useful between writes.
+        speed = db / dt if db > 0 else 0.0
+        if not hasattr(self, "_speed_samples"):
+            self._speed_samples = []
+        self._speed_samples.append((now, current))
+        cutoff = now - 8.0
+        self._speed_samples = [(t, b) for t, b in self._speed_samples if t >= cutoff]
+        if len(self._speed_samples) >= 2:
+            t0, b0 = self._speed_samples[0]
+            elapsed = max(0.5, now - t0)
+            speed = max(0.0, (current - b0) / elapsed)
+
         pct = (current / item.size * 100.0) if item.size else None
         eta = ((item.size - current) / speed) if item.size and speed > 0 else None
         self.emit("progress", {
@@ -445,6 +501,8 @@ class App:
         ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
         self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
         self.start_btn.grid(row=1, column=1, sticky="w", padx=6, pady=5)
+        self.clear_btn = ttk.Button(workshop, text="CLEAR OLD DATA", command=self.clear_old_data)
+        self.clear_btn.grid(row=1, column=2, padx=6, pady=5)
         self.stop_btn = ttk.Button(workshop, text="STOP", command=self.stop, state="disabled")
         self.stop_btn.grid(row=1, column=1, sticky="e", padx=6, pady=5)
         ttk.Label(workshop, textvariable=self.info_var).grid(row=2, column=1, sticky="w", padx=6, pady=5)
@@ -667,6 +725,7 @@ class App:
         self.bar.configure(value=0)
         self.status_var.set("Preparing…")
         self.start_btn.configure(state="disabled")
+        self.clear_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
 
         self.engine = Engine(
@@ -692,6 +751,46 @@ class App:
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
+
+    def clear_old_data(self):
+        # This button intentionally affects only the Workshop IDs in the queue.
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Clear old data", "Stop the current download before clearing old data.")
+            return
+        ids = self.ids()
+        if not ids:
+            messagebox.showerror("Clear old data", "Enter at least one numeric Workshop ID.")
+            return
+        if not messagebox.askyesno(
+            "Clear old data",
+            "Delete SteamCMD partial/installed data for:\n\n" + ", ".join(ids) +
+            "\n\nYour exported BO3-Workshop folder will NOT be touched.",
+            icon="warning",
+        ):
+            return
+
+        steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+        if not steamcmd.is_file():
+            messagebox.showerror("SteamCMD", "Select the SteamCMD executable first.")
+            return
+
+        user = self.user_var.get().strip() or detect_steam_user(steamcmd)
+        out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
+        engine = Engine(
+            steamcmd, user, out,
+            retries=0, watchdog=420, poll=2.0,
+            auto_export=False,
+            emit=lambda kind, payload: self.events.put((kind, payload)),
+        )
+        try:
+            removed = sum(engine.clear_item_data(iid) for iid in ids)
+            self.bar.configure(value=0)
+            self.progress_var.set("0 B / unknown")
+            self.speed_var.set("0 B/s")
+            self.eta_var.set("ETA --:--")
+            self.status_var.set(f"Cleared {removed} old Workshop folder(s)")
+        except Exception as exc:
+            messagebox.showerror("Clear old data", str(exc))
 
     def stop(self):
         if self.engine:
@@ -780,6 +879,7 @@ class App:
                         messagebox.showerror("Update", str(msg))
                 elif kind == "all_done":
                     self.start_btn.configure(state="normal")
+                    self.clear_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                     if self.status_var.get().startswith("Preparing") or self.status_var.get().startswith("Downloading"):
                         self.status_var.set("Queue finished")
