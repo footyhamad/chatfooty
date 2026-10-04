@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Menu, filedialog, messagebox
 from tkinter import ttk
 
 APP_ID = "311210"
@@ -484,7 +484,7 @@ class App:
         self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
         scroll.pack(side=RIGHT, fill=Y)
 
-        self.log_menu = tk.Menu(self.root, tearoff=False)
+        self.log_menu = Menu(self.root, tearoff=False)
         self.log_menu.add_command(label="Copy", command=self.copy_log)
         self.log_menu.add_command(label="Select All", command=self.select_all_log)
 
