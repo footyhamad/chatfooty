@@ -1,0 +1,9 @@
+{
+  "steamcmd": "B:\\scmd\\steamcmd.exe",
+  "steam_user": "",
+  "output_dir": "BO3-Workshop",
+  "max_retries": 0,
+  "hung_timeout_seconds": 420,
+  "poll_seconds": 2.0,
+  "auto_export": true
+}
