@@ -146,6 +146,62 @@ def system_network_bytes() -> int | None:
         return None
 
 
+def network_connection_signature() -> str | None:
+    """Return a small signature for the active network connection.
+
+    On Windows, Wi-Fi BSSID/SSID changes are useful for detecting an access-point
+    switch (for example 5 GHz -> 2.4 GHz). The downloader uses this only to
+    restart SteamCMD cleanly; partial Workshop data is preserved.
+    """
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["netsh", "wlan", "show", "interfaces"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            text = result.stdout or ""
+            state = re.search(r"^\\s*State\\s*:\\s*(.+)$", text, re.I | re.M)
+            if state and state.group(1).strip().lower() == "connected":
+                ssid = re.search(r"^\\s*SSID\\s*:\\s*(.+)$", text, re.I | re.M)
+                bssid = re.search(r"^\\s*BSSID\\s*:\\s*(.+)$", text, re.I | re.M)
+                channel = re.search(r"^\\s*Channel\\s*:\\s*(.+)$", text, re.I | re.M)
+                return "wifi|" + "|".join([
+                    ssid.group(1).strip() if ssid else "",
+                    bssid.group(1).strip().lower() if bssid else "",
+                    channel.group(1).strip() if channel else "",
+                ])
+        except Exception:
+            pass
+
+    # Fallback: identify active non-loopback IPv4 addresses. This also works
+    # when the connection is Ethernet or when Wi-Fi details are unavailable.
+    try:
+        import psutil  # type: ignore
+        parts = []
+        for name, addrs in psutil.net_if_addrs().items():
+            stats = psutil.net_if_stats().get(name)
+            if not stats or not stats.isup:
+                continue
+            ipv4 = sorted(
+                a.address for a in addrs
+                if getattr(a, "family", None) == __import__("socket").AF_INET
+                and not a.address.startswith("127.")
+            )
+            if ipv4:
+                parts.append(name + "=" + ",".join(ipv4))
+        if parts:
+            return "ip|" + "|".join(sorted(parts))
+    except Exception:
+        pass
+    return None
+
+
 def detect_steam_user(steamcmd: Path) -> str:
     cfg = steamcmd.parent / "config" / "config.vdf"
     if not cfg.exists():
@@ -376,7 +432,8 @@ class Engine:
 
     def _progress(self, item: ItemInfo, attempt: int, started: float,
                   prev_b: int, prev_t: float, last_net_b: int | None,
-                  last_net_t: float, net_samples: list[tuple[float, int]]):
+                  last_net_t: float, net_samples: list[tuple[float, int]],
+                  network_speed_ema: float):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
@@ -399,6 +456,12 @@ class Engine:
                 net_now = sampled
                 if last_net_b is not None and sampled >= last_net_b:
                     net_samples.append((now, sampled))
+                elif last_net_b is not None and sampled < last_net_b:
+                    # Adapter/counter reset (common after switching Wi-Fi).
+                    # Start a fresh measurement window instead of producing a
+                    # bogus multi-second speed spike or zero-rate ETA.
+                    net_samples.clear()
+                    network_speed_ema = 0.0
                 last_net_b = sampled
 
         cutoff = now - 8.0
@@ -406,9 +469,15 @@ class Engine:
         if len(net_samples) >= 2:
             t0, b0 = net_samples[0]
             elapsed = max(0.5, now - t0)
-            network_speed = max(0.0, (net_samples[-1][1] - b0) / elapsed)
+            raw_network_speed = max(0.0, (net_samples[-1][1] - b0) / elapsed)
+            # Smooth the displayed rate so normal 5G/Wi-Fi bursts do not make
+            # the UI jump wildly. This does not alter download accounting.
+            if network_speed_ema <= 0:
+                network_speed = raw_network_speed
+            else:
+                network_speed = (network_speed_ema * 0.75) + (raw_network_speed * 0.25)
         else:
-            network_speed = 0.0
+            network_speed = network_speed_ema if network_speed_ema > 0 else 0.0
 
         # Use the network rate for ETA when available. It is system-wide, so
         # other traffic can influence it; this is preferable to reporting
@@ -427,7 +496,7 @@ class Engine:
             "elapsed": now - started,
             "network_available": last_net_b is not None,
         })
-        return current, now, last_net_b, last_net_t
+        return current, now, last_net_b, last_net_t, network_speed
 
     def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
         """Perform cheap post-download integrity checks before declaring success."""
@@ -528,6 +597,9 @@ class Engine:
         last_net_b = system_network_bytes()
         last_net_t = prev_t
         net_samples: list[tuple[float, int]] = []
+        network_speed_ema = 0.0
+        network_signature = network_connection_signature()
+        last_network_check = prev_t
         last_activity = prev_t
         observed_b = prev_b
 
@@ -588,6 +660,8 @@ class Engine:
             killed = False
             stalled = False
             last_activity = time.monotonic()
+            network_signature = network_connection_signature()
+            last_network_check = last_activity
             observed_b = max(
                 sum_tree_bytes(self.partial_root / item.item_id),
                 sum_tree_bytes(self.installed_root / item.item_id),
@@ -617,13 +691,32 @@ class Engine:
 
                 if now - last_scan >= self.poll:
                     previous_b = observed_b
-                    prev_b, prev_t, last_net_b, last_net_t = self._progress(
+                    prev_b, prev_t, last_net_b, last_net_t, network_speed_ema = self._progress(
                         item, attempt, start, prev_b, prev_t,
-                        last_net_b, last_net_t, net_samples,
+                        last_net_b, last_net_t, net_samples, network_speed_ema,
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
                         last_activity = now
+
+                    # If the active Wi-Fi connection changes while SteamCMD is
+                    # running, restart SteamCMD instead of leaving the old
+                    # session stuck on the previous network path. Partial data
+                    # is preserved and the normal retry/backoff path takes over.
+                    if now - last_network_check >= 2.0:
+                        new_signature = network_connection_signature()
+                        last_network_check = now
+                        if network_signature is not None and new_signature != network_signature:
+                            killed = True
+                            self._kill(proc)
+                            self.emit(
+                                "status",
+                                "Network connection changed — restarting SteamCMD; partial data is preserved",
+                            )
+                            self._log(item.item_id, "NETWORK CHANGE DETECTED: restarting SteamCMD")
+                            network_signature = new_signature
+                            break
+                        network_signature = new_signature
 
                     if now - last_activity >= self.stall_seconds:
                         stalled = True
