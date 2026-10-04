@@ -665,7 +665,7 @@ class App:
             steamcmd, user, out,
             retries=retries, watchdog=watchdog,
             poll=2.0, auto_export=self.auto_export_var.get(),
-            emit=self.events.put,
+            emit=lambda kind, payload: self.events.put((kind, payload)),
         )
 
         def work():
