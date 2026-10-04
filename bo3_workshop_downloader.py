@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -807,4 +808,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        error = traceback.format_exc()
+        try:
+            Path(__file__).with_name("startup.log").write_text(error, encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("BO3 Workshop Downloader startup error", error)
+        except Exception:
+            pass
+        raise
