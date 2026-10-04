@@ -39,7 +39,7 @@ DEFAULTS = {
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SUCCESS_RE = re.compile(r"Success\. Downloaded item (\d+)", re.I)
 LOGIN_FAIL_RE = re.compile(r"Cached credentials not found|Invalid Password|Login Failure|Not logged on|password:\s*$", re.I | re.M)
-FAIL_RE = re.compile(r"ERROR!.*(?:Timeout|Failure)|Timeout downloading item|failed \\(Failure\\)", re.I)
+FAIL_RE = re.compile(r"ERROR!.*(?:Timeout|Failure)|Timeout downloading item|failed \(Failure\)", re.I)
 
 
 def human_bytes(n: int | float) -> str:
@@ -388,19 +388,25 @@ class Engine:
         # diagnostic but is NOT the network download rate.
         disk_speed = db / dt if db > 0 else 0.0
 
-        net_now = system_network_bytes()
-        if net_now is not None:
-            if last_net_b is not None and net_now >= last_net_b:
-                net_samples.append((now, net_now))
-            cutoff = now - 8.0
-            net_samples[:] = [(t, b) for t, b in net_samples if t >= cutoff]
-            if len(net_samples) >= 2:
-                t0, b0 = net_samples[0]
-                elapsed = max(0.5, now - t0)
-                network_speed = max(0.0, (net_now - b0) / elapsed)
-            else:
-                network_speed = 0.0
-            last_net_b, last_net_t = net_now, now
+        # PowerShell is only a fallback for machines without psutil and is
+        # relatively expensive to launch. Sample the system counter every 3s.
+        # This keeps the watchdog/progress loop responsive.
+        net_now = last_net_b
+        if now - last_net_t >= 3.0:
+            sampled = system_network_bytes()
+            last_net_t = now
+            if sampled is not None:
+                net_now = sampled
+                if last_net_b is not None and sampled >= last_net_b:
+                    net_samples.append((now, sampled))
+                last_net_b = sampled
+
+        cutoff = now - 8.0
+        net_samples[:] = [(t, b) for t, b in net_samples if t >= cutoff]
+        if len(net_samples) >= 2:
+            t0, b0 = net_samples[0]
+            elapsed = max(0.5, now - t0)
+            network_speed = max(0.0, (net_samples[-1][1] - b0) / elapsed)
         else:
             network_speed = 0.0
 
@@ -419,7 +425,7 @@ class Engine:
             "eta": eta,
             "attempt": attempt,
             "elapsed": now - started,
-            "network_available": net_now is not None,
+            "network_available": last_net_b is not None,
         })
         return current, now, last_net_b, last_net_t
 
@@ -971,6 +977,7 @@ class App:
         return list(dict.fromkeys(x for x in re.split(r"[\s,;]+", self.ids_var.get()) if x.isdigit()))
 
     def save(self):
+        # Keep the persisted settings intentionally small and human-readable.
         write_json(self.cfg_path, {
             "steamcmd": self.steamcmd_var.get().strip(),
             "steam_user": self.user_var.get().strip(),
