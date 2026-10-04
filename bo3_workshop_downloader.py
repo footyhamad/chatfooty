@@ -32,6 +32,7 @@ DEFAULTS = {
     "watchdog_seconds": 420,
     "poll_seconds": 2.0,
     "auto_export": True,
+    "inherit_steam_region": True,
 }
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SUCCESS_RE = re.compile(r"Success\. Downloaded item (\d+)", re.I)
@@ -105,6 +106,28 @@ def find_steamcmd() -> Path | None:
         Path(r"C:\Program Files\SteamCMD\steamcmd.exe"),
     ]
     return next((p for p in candidates if p.exists()), None)
+
+def find_steam_client_config() -> Path | None:
+    """Find the normal Steam client's config without reading account credentials."""
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Steam" / "config" / "config.vdf",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Steam" / "config" / "config.vdf",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Steam" / "config" / "config.vdf",
+    ]
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def read_steam_cell_id(config: Path) -> str | None:
+    """Read only Steam's selected download CellID."""
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"CellIDServerOverride"\s+"(\d+)"', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'"CurrentCellID"\s+"(\d+)"', text)
+    return m.group(1) if m else None
 
 
 @dataclass
@@ -192,6 +215,56 @@ class Engine:
         self.partial_root = root / "steamapps" / "workshop" / "downloads" / APP_ID
         self.installed_root = root / "steamapps" / "workshop" / "content" / APP_ID
         self.log_root = out / "_logs"
+
+    def sync_steam_region(self) -> str | None:
+        """Mirror the normal Steam client's selected CDN region into SteamCMD."""
+        client_cfg = find_steam_client_config()
+        if not client_cfg:
+            self.emit("log", "Steam region sync: normal Steam config.vdf not found")
+            return None
+        cell_id = read_steam_cell_id(client_cfg)
+        if not cell_id:
+            self.emit("log", f"Steam region sync: no CellID found in {client_cfg}")
+            return None
+
+        cmd_cfg = self.steamcmd.parent / "config" / "config.vdf"
+        if not cmd_cfg.is_file():
+            self.emit("log", f"Steam region sync: SteamCMD config not found at {cmd_cfg}")
+            return None
+
+        try:
+            text = cmd_cfg.read_text(encoding="utf-8", errors="replace")
+            backup = cmd_cfg.with_name("config.vdf.bo3wd-region-backup")
+            if not backup.exists():
+                shutil.copy2(cmd_cfg, backup)
+
+            changed = False
+            text, n1 = re.subn(
+                r'("CellIDServerOverride"\s+")\d+(")',
+                r'\g<1>' + cell_id + r'\g<2>',
+                text, count=1,
+            )
+            text, n2 = re.subn(
+                r'("CurrentCellID"\s+")\d+(")',
+                r'\g<1>' + cell_id + r'\g<2>',
+                text, count=1,
+            )
+            changed = bool(n1 or n2)
+            if not n1:
+                text, added = re.subn(
+                    r'("Steam"\s*\{)',
+                    r'\g<1>\n\t\t"CellIDServerOverride"\t"' + cell_id + r'"',
+                    text, count=1,
+                )
+                changed = changed or bool(added)
+
+            if changed:
+                cmd_cfg.write_text(text, encoding="utf-8")
+            self.emit("log", f"Steam region sync: using CellID {cell_id}" + (" (updated SteamCMD config)" if changed else ""))
+            return cell_id
+        except OSError as exc:
+            self.emit("log", f"Steam region sync skipped: {exc}")
+            return None
 
     def stop(self):
         self.stop_event.set()
@@ -501,6 +574,7 @@ class App:
         self.retry_var = StringVar(value=str(cfg["max_retries"]))
         self.watchdog_var = StringVar(value=str(cfg["watchdog_seconds"]))
         self.auto_export_var = BooleanVar(value=bool(cfg["auto_export"]))
+        self.inherit_region_var = BooleanVar(value=bool(cfg["inherit_steam_region"]))
 
         self.status_var = StringVar(value="Ready")
         self.progress_var = StringVar(value="0 B / unknown")
@@ -552,6 +626,7 @@ class App:
         ttk.Label(opts, text="Watchdog (sec)").pack(side=LEFT, padx=(18, 5))
         ttk.Entry(opts, textvariable=self.watchdog_var, width=7).pack(side=LEFT)
         ttk.Checkbutton(opts, text="Export completed item", variable=self.auto_export_var).pack(side=LEFT, padx=18)
+        ttk.Checkbutton(opts, text="Use Steam client's download region", variable=self.inherit_region_var).pack(side=LEFT, padx=18)
 
         progress = ttk.LabelFrame(main, text="Real progress", padding=10)
         progress.pack(fill=X, pady=(10, 0))
@@ -718,6 +793,7 @@ class App:
             "watchdog_seconds": int(self.watchdog_var.get() or 420),
             "poll_seconds": 2.0,
             "auto_export": bool(self.auto_export_var.get()),
+            "inherit_steam_region": bool(self.inherit_region_var.get()),
         })
 
     def lookup(self):
@@ -725,6 +801,11 @@ class App:
         if not ids:
             messagebox.showerror("Workshop", "Enter a numeric Workshop ID.")
             return
+        if self.inherit_region_var.get():
+            # SteamCMD has no documented download-region command, so mirror the
+            # normal Steam client's selected CellID into SteamCMD's own config.
+            self.engine.sync_steam_region()
+
         def work():
             for iid in ids:
                 try:
