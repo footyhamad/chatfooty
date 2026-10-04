@@ -30,13 +30,15 @@ DEFAULTS = {
     "output_dir": "BO3-Workshop",
     "max_retries": 0,
     "watchdog_seconds": 420,
+    "stall_seconds": 75,
     "poll_seconds": 2.0,
     "auto_export": True,
     "inherit_steam_region": True,
+    "retry_backoff_seconds": 5,
 }
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SUCCESS_RE = re.compile(r"Success\. Downloaded item (\d+)", re.I)
-LOGIN_FAIL_RE = re.compile(r"Cached credentials not found|Invalid Password|Login Failure|Not logged on|password:\\s*$", re.I | re.M)
+LOGIN_FAIL_RE = re.compile(r"Cached credentials not found|Invalid Password|Login Failure|Not logged on|password:\s*$", re.I | re.M)
 FAIL_RE = re.compile(r"ERROR!.*(?:Timeout|Failure)|Timeout downloading item|failed \\(Failure\\)", re.I)
 
 
@@ -86,6 +88,62 @@ def sum_tree_bytes(root: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def system_network_bytes() -> int | None:
+    """Return cumulative system network traffic in bytes.
+
+    This is intentionally system-wide rather than pretending we can isolate
+    SteamCMD traffic without packet-level/process tracing. On Windows we use
+    Get-NetAdapterStatistics when available; psutil is used as a lightweight
+    fallback if it is already installed. The value is only used for a live
+    speed estimate, not for download accounting.
+    """
+    try:
+        import psutil  # type: ignore
+        counters = psutil.net_io_counters()
+        if counters:
+            return int(counters.bytes_recv + counters.bytes_sent)
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            command = (
+                "$s=Get-NetAdapterStatistics -ErrorAction Stop; "
+                "$r=($s|Measure-Object -Property ReceivedBytes -Sum).Sum; "
+                "$t=($s|Measure-Object -Property SentBytes -Sum).Sum; "
+                "[Console]::WriteLine([int64]($r+$t))"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=4,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+            match = re.search(r"(?m)^\s*(\d+)\s*$", result.stdout or "")
+            if match:
+                return int(match.group(1))
+        except Exception:
+            pass
+
+    # Linux fallback for future portability.
+    try:
+        total = 0
+        with open("/proc/net/dev", "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                values = line.split(":", 1)[1].split()
+                if len(values) >= 9:
+                    total += int(values[0]) + int(values[8])
+        return total
+    except Exception:
+        return None
 
 
 def detect_steam_user(steamcmd: Path) -> str:
@@ -201,14 +259,17 @@ class WorkshopAPI:
 
 class Engine:
     def __init__(self, steamcmd: Path, user: str, out: Path, *,
-                 retries: int, watchdog: int, poll: float, auto_export: bool, emit):
+                 retries: int, watchdog: int, stall_seconds: int,
+                 poll: float, auto_export: bool, retry_backoff_seconds: int, emit):
         self.steamcmd = steamcmd
         self.user = user
         self.out = out
         self.max_retries = max(0, retries)
         self.watchdog = max(120, watchdog)
+        self.stall_seconds = max(30, stall_seconds)
         self.poll = max(0.5, poll)
         self.auto_export = auto_export
+        self.retry_backoff_seconds = max(1, retry_backoff_seconds)
         self.emit = emit
         self.stop_event = threading.Event()
         root = steamcmd.parent
@@ -313,7 +374,9 @@ class Engine:
         with (self.log_root / f"{item_id}.log").open("a", encoding="utf-8", errors="replace") as f:
             f.write(line.rstrip() + "\n")
 
-    def _progress(self, item: ItemInfo, attempt: int, started: float, prev_b: int, prev_t: float):
+    def _progress(self, item: ItemInfo, attempt: int, started: float,
+                  prev_b: int, prev_t: float, last_net_b: int | None,
+                  last_net_t: float, net_samples: list[tuple[float, int]]):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
@@ -321,32 +384,76 @@ class Engine:
         dt = max(0.5, now - prev_t)
         db = max(0, current - prev_b)
 
-        # File sizes change in bursts because SteamCMD writes/flushes chunks.
-        # A single 2-second delta therefore produces misleading 0 B/s readings.
-        # Use a rolling window so the displayed speed stays useful between writes.
-        speed = db / dt if db > 0 else 0.0
-        if not hasattr(self, "_speed_samples"):
-            self._speed_samples = []
-        self._speed_samples.append((now, current))
-        cutoff = now - 8.0
-        self._speed_samples = [(t, b) for t, b in self._speed_samples if t >= cutoff]
-        if len(self._speed_samples) >= 2:
-            t0, b0 = self._speed_samples[0]
-            elapsed = max(0.5, now - t0)
-            speed = max(0.0, (current - b0) / elapsed)
+        # SteamCMD writes data in bursts, so filesystem growth is useful as a
+        # diagnostic but is NOT the network download rate.
+        disk_speed = db / dt if db > 0 else 0.0
 
+        net_now = system_network_bytes()
+        if net_now is not None:
+            if last_net_b is not None and net_now >= last_net_b:
+                net_samples.append((now, net_now))
+            cutoff = now - 8.0
+            net_samples[:] = [(t, b) for t, b in net_samples if t >= cutoff]
+            if len(net_samples) >= 2:
+                t0, b0 = net_samples[0]
+                elapsed = max(0.5, now - t0)
+                network_speed = max(0.0, (net_now - b0) / elapsed)
+            else:
+                network_speed = 0.0
+            last_net_b, last_net_t = net_now, now
+        else:
+            network_speed = 0.0
+
+        # Use the network rate for ETA when available. It is system-wide, so
+        # other traffic can influence it; this is preferable to reporting
+        # SteamCMD's bursty disk writes as if they were Internet speed.
+        eta_speed = network_speed if network_speed > 0 else disk_speed
         pct = (current / item.size * 100.0) if item.size else None
-        eta = ((item.size - current) / speed) if item.size and speed > 0 else None
+        eta = ((item.size - current) / eta_speed) if item.size and eta_speed > 0 else None
         self.emit("progress", {
             "bytes": current,
             "total": item.size,
             "pct": pct,
-            "speed": speed,
+            "speed": network_speed,
+            "disk_speed": disk_speed,
             "eta": eta,
             "attempt": attempt,
             "elapsed": now - started,
+            "network_available": net_now is not None,
         })
-        return current, now
+        return current, now, last_net_b, last_net_t
+
+    def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
+        """Perform cheap post-download integrity checks before declaring success."""
+        if not installed.is_dir():
+            return False, "SteamCMD reported success, but the installed Workshop directory is missing."
+
+        size = sum_tree_bytes(installed)
+        if size <= 0:
+            return False, "SteamCMD reported success, but the installed Workshop directory is empty."
+
+        file_count = 0
+        try:
+            for _base, _dirs, files in os.walk(installed):
+                file_count += len(files)
+        except OSError as exc:
+            return False, f"Could not inspect the installed Workshop directory: {exc}"
+
+        if file_count == 0:
+            return False, "SteamCMD reported success, but no installed Workshop files were found."
+
+        if item.size:
+            ratio = size / item.size
+            if ratio < 0.95 or ratio > 1.05:
+                # Do not silently reject unusual Workshop metadata. The SteamCMD
+                # success marker remains authoritative, but surface a clear warning.
+                self.emit(
+                    "log",
+                    f"Integrity warning: installed size {human_bytes(size)} differs "
+                    f"from Steam's reported {human_bytes(item.size)} ({ratio * 100:.1f}%)."
+                )
+
+        return True, f"Verified {file_count:,} file(s), {human_bytes(size)} on disk"
 
     def export(self, item: ItemInfo) -> Path:
         src = self.installed_root / item.item_id
@@ -381,6 +488,13 @@ class Engine:
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         tmp.replace(dest)
+
+        exported_size = sum_tree_bytes(dest)
+        if exported_size != total:
+            raise RuntimeError(
+                f"Export verification failed: source={human_bytes(total)}, "
+                f"export={human_bytes(exported_size)}"
+            )
         return dest
 
     def _kill(self, proc: subprocess.Popen) -> None:
@@ -405,6 +519,11 @@ class Engine:
             sum_tree_bytes(self.installed_root / item.item_id),
         )
         prev_t = time.monotonic()
+        last_net_b = system_network_bytes()
+        last_net_t = prev_t
+        net_samples: list[tuple[float, int]] = []
+        last_activity = prev_t
+        observed_b = prev_b
 
         # A FRESH DOWNLOAD must really begin at zero. Check once before
         # SteamCMD starts; after that, partial bytes are intentionally kept
@@ -461,6 +580,12 @@ class Engine:
             threading.Thread(target=reader, daemon=True).start()
             last_scan = 0.0
             killed = False
+            stalled = False
+            last_activity = time.monotonic()
+            observed_b = max(
+                sum_tree_bytes(self.partial_root / item.item_id),
+                sum_tree_bytes(self.installed_root / item.item_id),
+            )
 
             while proc.poll() is None and not self.stop_event.is_set():
                 while True:
@@ -474,6 +599,7 @@ class Engine:
                     output.append(clean)
                     self._log(item.item_id, clean)
                     self.emit("log", clean)
+                    last_activity = time.monotonic()
 
                 now = time.monotonic()
                 if now - start >= self.watchdog:
@@ -484,7 +610,26 @@ class Engine:
                     break
 
                 if now - last_scan >= self.poll:
-                    prev_b, prev_t = self._progress(item, attempt, start, prev_b, prev_t)
+                    previous_b = observed_b
+                    prev_b, prev_t, last_net_b, last_net_t = self._progress(
+                        item, attempt, start, prev_b, prev_t,
+                        last_net_b, last_net_t, net_samples,
+                    )
+                    if prev_b > previous_b:
+                        observed_b = prev_b
+                        last_activity = now
+
+                    if now - last_activity >= self.stall_seconds:
+                        stalled = True
+                        killed = True
+                        self._kill(proc)
+                        self.emit(
+                            "status",
+                            f"No download activity for {self.stall_seconds}s — restarting; partial data is preserved",
+                        )
+                        self._log(item.item_id, f"STALL DETECTED after {self.stall_seconds}s without output or file growth")
+                        break
+
                     last_scan = now
                 time.sleep(0.05)
 
@@ -513,13 +658,32 @@ class Engine:
                 "total": item.size,
                 "pct": min(100.0, final_b / item.size * 100.0) if item.size else None,
                 "speed": 0.0,
+                "disk_speed": 0.0,
                 "eta": 0,
                 "attempt": attempt,
                 "elapsed": time.monotonic() - start,
+                "network_available": last_net_b is not None,
             })
 
             if SUCCESS_RE.search(text):
                 installed = self.installed_root / item.item_id
+                verified, verification_msg = self.verify_completed(item, installed)
+                if not verified:
+                    self.emit("status", verification_msg + " Retrying without deleting data.")
+                    self._log(item.item_id, "INTEGRITY CHECK FAILED: " + verification_msg)
+                    got = max(
+                        sum_tree_bytes(self.partial_root / item.item_id),
+                        sum_tree_bytes(installed),
+                    )
+                    prev_b = got
+                    prev_t = time.monotonic()
+                    delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
+                    self.emit("status", f"Retrying in {delay}s after integrity failure")
+                    if self.stop_event.wait(delay):
+                        break
+                    continue
+
+                self.emit("status", "Integrity check passed: " + verification_msg)
                 try:
                     exported = self.export(item) if self.auto_export else installed
                     self.emit("finished", (True, f"Completed → {exported}"))
@@ -537,14 +701,31 @@ class Engine:
                     sum_tree_bytes(self.partial_root / item.item_id),
                     sum_tree_bytes(self.installed_root / item.item_id),
                 )
-                self.emit("status", f"SteamCMD failed/timed out at {human_bytes(got)} — retrying without deleting data")
+                reason = (
+                    "stall" if stalled else
+                    "watchdog" if killed and "WATCHDOG" in "\n".join(output) else
+                    "SteamCMD failure"
+                )
+                delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
+                self.emit(
+                    "status",
+                    f"{reason.capitalize()} at {human_bytes(got)} — retrying in {delay}s; "
+                    "partial data will be preserved",
+                )
+                self._log(item.item_id, f"RETRY: reason={reason}, delay={delay}s, bytes={got}")
                 prev_b = got
                 prev_t = time.monotonic()
+                if self.stop_event.wait(delay):
+                    break
                 continue
 
-            self.emit("status", "SteamCMD exited without a success marker — retrying")
+            delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
+            self.emit("status", f"No success marker — retrying in {delay}s")
+            self._log(item.item_id, f"RETRY: no success marker, delay={delay}s")
             prev_b = final_b
             prev_t = time.monotonic()
+            if self.stop_event.wait(delay):
+                break
 
         self.emit("finished", (False, "Stopped"))
         return None
@@ -573,12 +754,14 @@ class App:
         self.ids_var = StringVar(value="3296316642")
         self.retry_var = StringVar(value=str(cfg["max_retries"]))
         self.watchdog_var = StringVar(value=str(cfg["watchdog_seconds"]))
+        self.stall_var = StringVar(value=str(cfg["stall_seconds"]))
         self.auto_export_var = BooleanVar(value=bool(cfg["auto_export"]))
         self.inherit_region_var = BooleanVar(value=bool(cfg["inherit_steam_region"]))
 
         self.status_var = StringVar(value="Ready")
         self.progress_var = StringVar(value="0 B / unknown")
-        self.speed_var = StringVar(value="0 B/s")
+        self.speed_var = StringVar(value="Network: 0 B/s")
+        self.disk_speed_var = StringVar(value="Disk: 0 B/s")
         self.eta_var = StringVar(value="ETA --:--")
         self.attempt_var = StringVar(value="Attempt 0")
         self.info_var = StringVar(value="")
@@ -625,6 +808,8 @@ class App:
         ttk.Entry(opts, textvariable=self.retry_var, width=7).pack(side=LEFT)
         ttk.Label(opts, text="Watchdog (sec)").pack(side=LEFT, padx=(18, 5))
         ttk.Entry(opts, textvariable=self.watchdog_var, width=7).pack(side=LEFT)
+        ttk.Label(opts, text="Stall (sec)").pack(side=LEFT, padx=(18, 5))
+        ttk.Entry(opts, textvariable=self.stall_var, width=7).pack(side=LEFT)
         ttk.Checkbutton(opts, text="Export completed item", variable=self.auto_export_var).pack(side=LEFT, padx=18)
         ttk.Checkbutton(opts, text="Use Steam client's download region", variable=self.inherit_region_var).pack(side=LEFT, padx=18)
 
@@ -636,6 +821,7 @@ class App:
         row.pack(fill=X)
         ttk.Label(row, textvariable=self.progress_var, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
         ttk.Label(row, textvariable=self.speed_var).pack(side=LEFT, padx=25)
+        ttk.Label(row, textvariable=self.disk_speed_var).pack(side=LEFT, padx=25)
         ttk.Label(row, textvariable=self.eta_var).pack(side=LEFT, padx=25)
         ttk.Label(row, textvariable=self.attempt_var).pack(side=RIGHT)
 
@@ -791,6 +977,7 @@ class App:
             "output_dir": self.output_var.get().strip(),
             "max_retries": int(self.retry_var.get() or 0),
             "watchdog_seconds": int(self.watchdog_var.get() or 420),
+            "stall_seconds": int(self.stall_var.get() or 75),
             "poll_seconds": 2.0,
             "auto_export": bool(self.auto_export_var.get()),
             "inherit_steam_region": bool(self.inherit_region_var.get()),
@@ -802,9 +989,16 @@ class App:
             messagebox.showerror("Workshop", "Enter a numeric Workshop ID.")
             return
         if self.inherit_region_var.get():
-            # SteamCMD has no documented download-region command, so mirror the
-            # normal Steam client's selected CellID into SteamCMD's own config.
-            self.engine.sync_steam_region()
+            steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+            if steamcmd.is_file():
+                lookup_engine = Engine(
+                    steamcmd, self.user_var.get().strip() or detect_steam_user(steamcmd),
+                    Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
+                    retries=0, watchdog=420, stall_seconds=75, poll=2.0,
+                    auto_export=False, retry_backoff_seconds=5,
+                    emit=lambda kind, payload: self.events.put((kind, payload)),
+                )
+                lookup_engine.sync_steam_region()
 
         def work():
             for iid in ids:
@@ -834,8 +1028,11 @@ class App:
         try:
             retries = int(self.retry_var.get())
             watchdog = int(self.watchdog_var.get())
+            stall_seconds = int(self.stall_var.get())
+            if stall_seconds < 30:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Settings", "Retries and watchdog must be integers.")
+            messagebox.showerror("Settings", "Retries, watchdog, and stall timeout must be valid integers (stall >= 30).")
             return
 
         self.save()
@@ -849,9 +1046,16 @@ class App:
         self.engine = Engine(
             steamcmd, user, out,
             retries=retries, watchdog=watchdog,
+            stall_seconds=stall_seconds,
             poll=2.0, auto_export=self.auto_export_var.get(),
+            retry_backoff_seconds=5,
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
+
+        if self.inherit_region_var.get():
+            # SteamCMD has no documented region selector; mirror the normal
+            # Steam client's CellID as a best-effort CDN-region preference.
+            self.engine.sync_steam_region()
 
         def work():
             for iid in ids:
@@ -899,8 +1103,8 @@ class App:
         out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
         engine = Engine(
             steamcmd, user, out,
-            retries=0, watchdog=420, poll=2.0,
-            auto_export=False,
+            retries=0, watchdog=420, stall_seconds=75, poll=2.0,
+            auto_export=False, retry_backoff_seconds=5,
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
         try:
@@ -908,7 +1112,8 @@ class App:
             self.fresh_ids.update(ids)
             self.bar.configure(value=0)
             self.progress_var.set("0 B / unknown")
-            self.speed_var.set("0 B/s")
+            self.speed_var.set("Network: 0 B/s")
+            self.disk_speed_var.set("Disk: 0 B/s")
             self.eta_var.set("ETA --:--")
             self.status_var.set(
                 f"Fresh-download cleanup complete: removed {removed} old folder(s); start is verified at 0 B"
@@ -980,7 +1185,11 @@ class App:
                     total = human_bytes(p["total"]) if p["total"] else "unknown"
                     pct = f" ({p['pct']:.2f}%)" if p["pct"] is not None else ""
                     self.progress_var.set(f"{human_bytes(p['bytes'])} / {total}{pct}")
-                    self.speed_var.set(human_speed(p["speed"]))
+                    if p.get("network_available"):
+                        self.speed_var.set("Network: " + human_speed(p["speed"]))
+                    else:
+                        self.speed_var.set("Network: unavailable")
+                    self.disk_speed_var.set("Disk: " + human_speed(p.get("disk_speed", 0.0)))
                     self.eta_var.set("ETA " + eta_text(p["eta"]))
                     self.attempt_var.set(f"Attempt {p['attempt']}")
                 elif kind == "export_progress":
