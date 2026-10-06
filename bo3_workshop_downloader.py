@@ -749,6 +749,51 @@ class Engine:
         })
         return current, now, last_net_b, last_net_t, network_speed_ema, disk_speed_ema
 
+    def _invalid_bo3_fastfiles(self, root: Path) -> list[tuple[Path, bytes]]:
+        """Return .ff files whose BO3 T7 fastfile header is invalid."""
+        invalid: list[tuple[Path, bytes]] = []
+        if not root.is_dir():
+            return invalid
+        expected = b"TAff\x00\x00"
+        try:
+            for base, _dirs, files in os.walk(root):
+                for name in files:
+                    if not name.lower().endswith(".ff"):
+                        continue
+                    path = Path(base) / name
+                    try:
+                        with path.open("rb") as f:
+                            header = f.read(len(expected))
+                    except OSError:
+                        invalid.append((path, b""))
+                        continue
+                    if header != expected:
+                        invalid.append((path, header))
+        except OSError as exc:
+            self.emit("log", f"Could not scan Workshop fastfiles: {exc}")
+        return invalid
+
+    def _repair_invalid_bo3_fastfiles(self, invalid: list[tuple[Path, bytes]]) -> int:
+        """Remove only invalid installed .ff files so SteamCMD is forced to redownload them."""
+        removed = 0
+        for path, header in invalid:
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+                    self._log(
+                        path.name,
+                        f"INVALID FASTFILE REMOVED: {path} header={header.hex() or 'unreadable'}",
+                    )
+                    self.emit(
+                        "log",
+                        f"Integrity repair: removed invalid fastfile {path} "
+                        f"(header {header.hex() or 'unreadable'}; expected 544166660000).",
+                    )
+            except OSError as exc:
+                raise RuntimeError(f"Could not remove invalid fastfile {path}: {exc}") from exc
+        return removed
+
     def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
         """Perform cheap post-download integrity checks before declaring success."""
         if not installed.is_dir():
@@ -767,6 +812,18 @@ class Engine:
 
         if file_count == 0:
             return False, "SteamCMD reported success, but no installed Workshop files were found."
+
+        invalid_fastfiles = self._invalid_bo3_fastfiles(installed)
+        if invalid_fastfiles:
+            details = ", ".join(
+                f"{path.name}={header.hex() or 'unreadable'}"
+                for path, header in invalid_fastfiles[:5]
+            )
+            extra = "" if len(invalid_fastfiles) <= 5 else f" (+{len(invalid_fastfiles) - 5} more)"
+            return False, (
+                "SteamCMD reported success, but the installed Workshop data contains "
+                f"{len(invalid_fastfiles)} invalid BO3 fastfile(s): {details}{extra}"
+            )
 
         if item.size and item.size_source != "Workshop webpage (theoretical)":
             ratio = size / item.size
@@ -886,6 +943,7 @@ class Engine:
         last_network_check = prev_t
         last_activity = prev_t
         observed_b = prev_b
+        quick_failures = 0
 
         # A FRESH DOWNLOAD must really begin at zero. Check once before
         # SteamCMD starts; after that, partial bytes are intentionally kept
@@ -1128,8 +1186,21 @@ class Engine:
                 installed = self.installed_root / item.item_id
                 verified, verification_msg = self.verify_completed(item, installed)
                 if not verified:
-                    self.emit("status", verification_msg + " Retrying without deleting data.")
+                    self.emit("status", verification_msg + " Repairing invalid files and retrying.")
                     self._log(item.item_id, "INTEGRITY CHECK FAILED: " + verification_msg)
+                    invalid_fastfiles = self._invalid_bo3_fastfiles(installed)
+                    if invalid_fastfiles:
+                        try:
+                            removed = self._repair_invalid_bo3_fastfiles(invalid_fastfiles)
+                            self.emit(
+                                "status",
+                                f"Integrity repair removed {removed} invalid fastfile(s); "
+                                "SteamCMD will redownload them. Other Workshop data is preserved."
+                            )
+                        except Exception as exc:
+                            self._log(item.item_id, f"INTEGRITY REPAIR FAILED: {exc}")
+                            self.emit("status", f"Integrity repair failed: {exc}")
+                            return None
                     got = max(
                         sum_tree_bytes(self.partial_root / item.item_id),
                         sum_tree_bytes(installed),
