@@ -634,7 +634,7 @@ class Engine:
             "elapsed": now - started,
             "network_available": last_net_b is not None,
         })
-        return current, now, last_net_b, last_net_t, network_speed, disk_speed_ema
+        return current, now, last_net_b, last_net_t, network_speed_ema, disk_speed_ema
 
     def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
         """Perform cheap post-download integrity checks before declaring success."""
@@ -881,7 +881,7 @@ class Engine:
                                 "log",
                                 f"DOWNLOAD: {human_bytes(prev_b)} / "
                                 f"{human_bytes(item.size) if item.size else 'unknown'} | "
-                                f"network {human_speed(network_speed_ema)} | "
+                                f"download {human_speed(steamcmd_download_speed)} | "
                                 f"disk write {human_speed(disk_speed_ema)}",
                             )
 
