@@ -1222,6 +1222,7 @@ class App:
         self.stall_var = StringVar(value=str(cfg["stall_seconds"]))
         self.auto_export_var = BooleanVar(value=bool(cfg["auto_export"]))
         self.inherit_region_var = BooleanVar(value=bool(cfg["inherit_steam_region"]))
+        self.max_throughput_var = BooleanVar(value=bool(cfg["max_throughput"]))
         self.dark_mode_var = BooleanVar(value=bool(cfg["dark_mode"]))
 
         self.status_var = StringVar(value="Ready")
@@ -1290,6 +1291,9 @@ class App:
         ttk.Entry(opts, textvariable=self.stall_var, width=7).pack(side=LEFT)
         ttk.Checkbutton(opts, text="Export completed item", variable=self.auto_export_var).pack(side=LEFT, padx=18)
         ttk.Checkbutton(opts, text="Use Steam client's download region", variable=self.inherit_region_var).pack(side=LEFT, padx=18)
+        ttk.Checkbutton(
+            opts, text="MAX THROUGHPUT", variable=self.max_throughput_var
+        ).pack(side=LEFT, padx=18)
 
         progress = ttk.LabelFrame(main, text="  DOWNLOAD STATUS  ", padding=12)
         progress.pack(fill=X, pady=(10, 0))
@@ -1501,6 +1505,7 @@ class App:
             "poll_seconds": 1.0,
             "auto_export": bool(self.auto_export_var.get()),
             "inherit_steam_region": bool(self.inherit_region_var.get()),
+            "max_throughput": bool(self.max_throughput_var.get()),
             "last_started_ids": self.last_started_ids,
             "dark_mode": bool(self.dark_mode_var.get()),
         })
@@ -1517,7 +1522,7 @@ class App:
                     steamcmd, self.user_var.get().strip() or detect_steam_user(steamcmd),
                     Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
                     retries=0, watchdog=420, stall_seconds=75, poll=1.0,
-                    auto_export=False, retry_backoff_seconds=5, max_throughput=True,
+                    auto_export=False, retry_backoff_seconds=5, max_throughput=False,
                     emit=lambda kind, payload: self.events.put((kind, payload)),
                 )
                 lookup_engine.sync_steam_region()
@@ -1573,9 +1578,10 @@ class App:
             retries=retries, watchdog=watchdog,
             stall_seconds=stall_seconds,
             poll=1.0, auto_export=self.auto_export_var.get(),
-            retry_backoff_seconds=5, max_throughput=True,
+            retry_backoff_seconds=5, max_throughput=self.max_throughput_var.get(),
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
+        self.events.put(("log", "MAX THROUGHPUT: " + ("ENABLED" if self.max_throughput_var.get() else "disabled")))
 
         if self.inherit_region_var.get():
             # SteamCMD has no documented region selector; mirror the normal
@@ -1631,8 +1637,8 @@ class App:
         out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
         engine = Engine(
             steamcmd, user, out,
-            retries=0, watchdog=420, stall_seconds=75, poll=2.0,
-            auto_export=False, retry_backoff_seconds=5,
+            retries=0, watchdog=420, stall_seconds=75, poll=1.0,
+            auto_export=False, retry_backoff_seconds=5, max_throughput=False,
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
         try:
