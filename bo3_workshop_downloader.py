@@ -547,7 +547,7 @@ class Engine:
             "elapsed": now - started,
             "network_available": last_net_b is not None,
         })
-        return current, now, last_net_b, last_net_t, network_speed
+        return current, now, last_net_b, last_net_t, network_speed, disk_speed_ema
 
     def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
         """Perform cheap post-download integrity checks before declaring success."""
