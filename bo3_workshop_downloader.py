@@ -112,6 +112,32 @@ def process_write_bytes(pid: int) -> int | None:
         return None
 
 
+STEAMCMD_RATE_RE = re.compile(
+    r"Current download rate:\s*([0-9]+(?:\.[0-9]+)?)\s*(Mbps|Kbps|B/s|KB/s|MB/s|GB/s)",
+    re.I,
+)
+
+
+def parse_steamcmd_download_rate(text: str) -> float | None:
+    """Parse SteamCMD's own reported download rate and return bytes/second."""
+    matches = list(STEAMCMD_RATE_RE.finditer(text or ""))
+    if not matches:
+        return None
+    match = matches[-1]
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    multipliers = {
+        "bps": 1.0 / 8.0,
+        "kbps": 1000.0 / 8.0,
+        "mbps": 1000_000.0 / 8.0,
+        "b/s": 1.0,
+        "kb/s": 1024.0,
+        "mb/s": 1024.0 ** 2,
+        "gb/s": 1024.0 ** 3,
+    }
+    return value * multipliers[unit]
+
+
 def system_network_bytes() -> int | None:
     """Return cumulative system network traffic in bytes.
 
@@ -511,7 +537,8 @@ class Engine:
                   last_net_t: float, net_samples: list[tuple[float, int]],
                   progress_samples: list[tuple[float, int]],
                   network_speed_ema: float, disk_speed_ema: float,
-                  steamcmd_pid: int, disk_io_samples: list[tuple[float, int]]):
+                  steamcmd_pid: int, disk_io_samples: list[tuple[float, int]],
+                  steamcmd_download_speed: float):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
@@ -555,9 +582,8 @@ class Engine:
         if workshop_speed <= 0.0 and current > prev_b:
             workshop_speed = db / dt
 
-        # PowerShell is only a fallback for machines without psutil and is
-        # relatively expensive to launch. Sample the system counter every 3s.
-        # This keeps the watchdog/progress loop responsive.
+        # Keep the system-wide network counter as a fallback diagnostic only.
+        # The primary displayed download speed comes from SteamCMD itself.
         net_now = last_net_b
         if now - last_net_t >= 3.0:
             sampled = system_network_bytes()
@@ -567,28 +593,29 @@ class Engine:
                 if last_net_b is not None and sampled >= last_net_b:
                     net_samples.append((now, sampled))
                 elif last_net_b is not None and sampled < last_net_b:
-                    # Adapter/counter reset (common after switching Wi-Fi).
-                    # Start a fresh measurement window instead of producing a
-                    # bogus multi-second speed spike or zero-rate ETA.
                     net_samples.clear()
                     network_speed_ema = 0.0
                 last_net_b = sampled
 
-        cutoff = now - 8.0
-        net_samples[:] = [(t, b) for t, b in net_samples if t >= cutoff]
+        cutoff_net = now - 8.0
+        net_samples[:] = [(t, b) for t, b in net_samples if t >= cutoff_net]
         if len(net_samples) >= 2:
             t0, b0 = net_samples[0]
-            elapsed = max(0.5, now - t0)
-            raw_network_speed = max(0.0, (net_samples[-1][1] - b0) / elapsed)
-            # Smooth the displayed rate so normal 5G/Wi-Fi bursts do not make
-            # the UI jump wildly. This does not alter download accounting.
+            elapsed_net = max(0.5, now - t0)
+            raw_network_speed = max(0.0, (net_samples[-1][1] - b0) / elapsed_net)
             if network_speed_ema <= 0:
-                network_speed = raw_network_speed
+                network_speed_ema = raw_network_speed
             else:
-                network_speed = (network_speed_ema * 0.75) + (raw_network_speed * 0.25)
-            network_speed_ema = network_speed
-        else:
-            network_speed = network_speed_ema if network_speed_ema > 0 else 0.0
+                network_speed_ema = (network_speed_ema * 0.75) + (raw_network_speed * 0.25)
+
+        # SteamCMD's own rate is the authoritative download-speed display.
+        # If its content log has not emitted a rate yet, temporarily fall back
+        # to the smoothed system counter rather than showing zero.
+        download_speed = (
+            steamcmd_download_speed
+            if steamcmd_download_speed > 0
+            else (network_speed_ema if network_speed_ema > 0 else 0.0)
+        )
 
         # System network and disk-write rates are diagnostics. ETA uses the
         # rolling Workshop byte-growth rate, which tracks actual download progress.
@@ -599,7 +626,7 @@ class Engine:
             "bytes": current,
             "total": item.size,
             "pct": pct,
-            "speed": network_speed,
+            "speed": download_speed,
             "disk_speed": disk_speed,
             "disk_speed_ema": disk_speed_ema,
             "eta": eta,
@@ -735,6 +762,7 @@ class Engine:
         progress_samples: list[tuple[float, int]] = [(prev_t, prev_b)]
         disk_io_samples: list[tuple[float, int]] = []
         network_speed_ema = 0.0
+        steamcmd_download_speed = 0.0
         disk_speed_ema = 0.0
         network_signature = network_connection_signature()
         last_network_check = prev_t
@@ -843,6 +871,7 @@ class Engine:
                         item, attempt, start, prev_b, prev_t,
                         last_net_b, last_net_t, net_samples, progress_samples,
                         network_speed_ema, disk_speed_ema, proc.pid, disk_io_samples,
+                        steamcmd_download_speed,
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
@@ -875,6 +904,13 @@ class Engine:
                                 content_line = content_line.strip()
                                 if not content_line:
                                     continue
+                                parsed_speed = parse_steamcmd_download_rate(content_line)
+                                if parsed_speed is not None:
+                                    steamcmd_download_speed = parsed_speed
+                                    self.emit(
+                                        "log",
+                                        f"DOWNLOAD RATE: {human_speed(steamcmd_download_speed)} (SteamCMD)",
+                                    )
                                 live_line = "CONTENT: " + content_line
                                 self.emit("log", live_line)
                                 self._log(item.item_id, live_line)
@@ -1082,7 +1118,7 @@ class App:
 
         self.status_var = StringVar(value="Ready")
         self.progress_var = StringVar(value="0 B / unknown")
-        self.speed_var = StringVar(value="System network: 0 B/s")
+        self.speed_var = StringVar(value="Download: 0 B/s")
         self.disk_speed_var = StringVar(value="Disk write: 0 B/s")
         self.eta_var = StringVar(value="ETA --:--")
         self.attempt_var = StringVar(value="Attempt 0")
@@ -1496,7 +1532,7 @@ class App:
             self.fresh_ids.update(ids)
             self.bar.configure(value=0)
             self.progress_var.set("0 B / unknown")
-            self.speed_var.set("System network: 0 B/s")
+            self.speed_var.set("Download: 0 B/s")
             self.disk_speed_var.set("Disk: 0 B/s")
             self.eta_var.set("ETA --:--")
             self.status_var.set(
@@ -1574,9 +1610,9 @@ class App:
                     pct = f" ({p['pct']:.2f}%)" if p["pct"] is not None else ""
                     self.progress_var.set(f"{human_bytes(p['bytes'])} / {total}{pct}")
                     if p.get("network_available"):
-                        self.speed_var.set("System network: " + human_speed(p["speed"]))
+                        self.speed_var.set("Download: " + human_speed(p["speed"]))
                     else:
-                        self.speed_var.set("System network: unavailable")
+                        self.speed_var.set("Download: unavailable")
                     disk_speed = p.get("disk_speed", 0.0)
                     self.disk_speed_var.set("Disk write: " + human_speed(disk_speed))
                     self.eta_var.set("ETA " + eta_text(p["eta"]))
