@@ -1479,51 +1479,58 @@ class App:
         self.update_thread.start()
 
     def fetch_remote_source(self) -> tuple[bytes, str]:
-        """Fetch bo3_workshop_downloader.py from the main branch without requiring Git."""
-        raw_url = "https://raw.githubusercontent.com/footyhamad/chatfooty/main/bo3_workshop_downloader.py"
+        """Fetch the main-branch source, preferring the authenticated GitHub API."""
+        # Prefer the GitHub API when gh is authenticated. This avoids serving a
+        # stale raw.githubusercontent.com response from a cache/CDN.
         try:
-            req = urllib.request.Request(
-                raw_url,
-                headers={"User-Agent": "BO3-Workshop-Downloader-Updater/1.0"},
+            proc = subprocess.run(
+                [
+                    "gh", "api",
+                    "repos/footyhamad/chatfooty/contents/bo3_workshop_downloader.py",
+                    "--method", "GET",
+                    "--field", "ref=main",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
             )
+            if proc.returncode == 0:
+                payload = json.loads(proc.stdout.decode("utf-8"))
+                data = base64.b64decode(payload["content"])
+                remote_sha = payload.get("sha", "")
+                if not remote_sha:
+                    remote_sha = hashlib.sha1(
+                        b"blob " + str(len(data)).encode() + b"\0" + data
+                    ).hexdigest()
+                return data, remote_sha
+        except (FileNotFoundError, json.JSONDecodeError, subprocess.SubprocessError):
+            pass
+
+        # Public/raw fallback for machines without GitHub CLI authentication.
+        raw_url = (
+            "https://raw.githubusercontent.com/footyhamad/chatfooty/main/"
+            "bo3_workshop_downloader.py?bo3wd=" + str(int(time.time()))
+        )
+        req = urllib.request.Request(
+            raw_url,
+            headers={
+                "User-Agent": "BO3-Workshop-Downloader-Updater/1.0",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
+        )
+        try:
             with urllib.request.urlopen(req, timeout=20) as response:
                 data = response.read()
-            sha = hashlib.sha1(
+            remote_sha = hashlib.sha1(
                 b"blob " + str(len(data)).encode() + b"\0" + data
             ).hexdigest()
-            return data, sha
-        except Exception:
-            # The repository is private in the normal setup, so use an already
-            # authenticated GitHub CLI session as the fallback.
-            try:
-                proc = subprocess.run(
-                    [
-                        "gh", "api",
-                        "repos/footyhamad/chatfooty/contents/bo3_workshop_downloader.py",
-                        "--method", "GET",
-                        "--field", "ref=main",
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    timeout=30,
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(
-                    "GitHub update requires either a public repo or GitHub CLI (gh) "
-                    "authenticated to the repo."
-                ) from exc
-            if proc.returncode != 0:
-                detail = proc.stderr.decode("utf-8", "replace").strip()
-                raise RuntimeError("GitHub API update failed: " + (detail or "unknown error"))
-
-            payload = json.loads(proc.stdout.decode("utf-8"))
-            data = base64.b64decode(payload["content"])
-            remote_sha = payload.get("sha", "")
-            if not remote_sha:
-                remote_sha = hashlib.sha1(
-                    b"blob " + str(len(data)).encode() + b"\0" + data
-                ).hexdigest()
             return data, remote_sha
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not fetch the latest GitHub source. "
+                "Authenticate GitHub CLI with 'gh auth login' or check internet access."
+            ) from exc
 
     def restart_after_update(self, temp_path: str):
         self.save()
