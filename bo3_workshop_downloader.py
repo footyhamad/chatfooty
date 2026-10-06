@@ -1329,7 +1329,7 @@ class App:
 
     def update_app(self):
         """Download the latest source from GitHub and replace this file.
-        
+
         This is deliberately NOT a git operation. It works from a copied source folder
         as well as from a checkout. Private-repository access uses the authenticated
         GitHub CLI when available; public repositories can use the raw URL directly.
@@ -1356,7 +1356,35 @@ class App:
 
                 remote_text = remote_bytes.decode("utf-8", "replace")
                 remote_revision_match = re.search(
-                    r'^BUILD_REVISION = "([^"]+)"                temp.write_bytes(remote_bytes)
+                    r'^BUILD_REVISION = "([^"]+)"$',
+                    remote_text,
+                    re.M,
+                )
+                remote_revision = (
+                    remote_revision_match.group(1)
+                    if remote_revision_match
+                    else remote_sha
+                )
+                local_revision = globals().get("BUILD_REVISION", "")
+                self.events.put((
+                    "log",
+                    f"UPDATE CHECK: local={local_revision or 'unknown'} remote={remote_revision}",
+                ))
+
+                # A missing local build revision means this is an older build.
+                # Revision comparison takes precedence over byte hashing.
+                if local_revision and remote_revision == local_revision:
+                    self.events.put((
+                        "update_result",
+                        (True, f"Already up to date ({local_revision[:8]})."),
+                    ))
+                    return
+                if not local_revision and remote_sha == current_sha:
+                    self.events.put(("update_result", (True, "Already up to date.")))
+                    return
+
+                temp = script.with_suffix(script.suffix + ".update")
+                temp.write_bytes(remote_bytes)
                 self.events.put(("update_ready", str(temp)))
             except Exception as exc:
                 self.events.put(("update_result", (False, str(exc))))
