@@ -35,6 +35,8 @@ DEFAULTS = {
     "auto_export": True,
     "inherit_steam_region": True,
     "retry_backoff_seconds": 5,
+    "quick_failure_limit": 3,
+    "quick_failure_window": 20,
     "last_started_ids": "3296316642",
     "dark_mode": False,
 }
@@ -56,6 +58,15 @@ def human_bytes(n: int | float) -> str:
 
 def human_speed(n: float) -> str:
     return human_bytes(n) + "/s"
+
+
+def normalize_workshop_id(value: str) -> str:
+    """Accept a numeric Workshop ID or a Steam Workshop URL."""
+    value = value.strip().strip('"')
+    if value.isdigit():
+        return value
+    match = re.search(r"(?:[?&]id=|/sharedfiles/filedetails/\?id=)(\d+)", value, re.I)
+    return match.group(1) if match else ""
 
 
 def eta_text(seconds: float | None) -> str:
@@ -328,12 +339,15 @@ class Engine:
         self.poll = max(0.5, poll)
         self.auto_export = auto_export
         self.retry_backoff_seconds = max(1, retry_backoff_seconds)
+        self.quick_failure_limit = 3
+        self.quick_failure_window = 20
         self.emit = emit
         self.stop_event = threading.Event()
         root = steamcmd.parent
         self.partial_root = root / "steamapps" / "workshop" / "downloads" / APP_ID
         self.installed_root = root / "steamapps" / "workshop" / "content" / APP_ID
         self.log_root = out / "_logs"
+        self.content_log = root / "logs" / "content_log.txt"
 
     def sync_steam_region(self) -> str | None:
         """Mirror the normal Steam client's selected CDN region into SteamCMD."""
@@ -431,6 +445,33 @@ class Engine:
         self.log_root.mkdir(parents=True, exist_ok=True)
         with (self.log_root / f"{item_id}.log").open("a", encoding="utf-8", errors="replace") as f:
             f.write(line.rstrip() + "\n")
+
+    def _content_log_tail(self, max_bytes: int = 32768) -> str:
+        """Read SteamCMD's content log tail without disturbing SteamCMD."""
+        try:
+            with self.content_log.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes), os.SEEK_SET)
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _steamcmd_failure_signal(self, text: str) -> str | None:
+        """Detect the failure forms SteamCMD commonly emits."""
+        if not text:
+            return None
+        patterns = (
+            r"ERROR!.*Download item.*failed",
+            r"Timeout downloading item",
+            r"failed \(Failure\)",
+            r"ERROR!.*(?:Timeout|Failure)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.I | re.S)
+            if match:
+                return re.sub(r"\s+", " ", match.group(0)).strip()[-240:]
+        return None
 
     def _progress(self, item: ItemInfo, attempt: int, started: float,
                   prev_b: int, prev_t: float, last_net_b: int | None,
@@ -712,6 +753,14 @@ class Engine:
                     if new_content_log_stamp != content_log_stamp:
                         content_log_stamp = new_content_log_stamp
                         last_activity = now
+                        failure_signal = self._steamcmd_failure_signal(self._content_log_tail())
+                        if failure_signal:
+                            killed = True
+                            killed_reason = "SteamCMD content-log failure"
+                            self._kill(proc)
+                            self.emit("status", "SteamCMD reported a download failure — restarting; partial data is preserved")
+                            self._log(item.item_id, "CONTENT LOG FAILURE: " + failure_signal)
+                            break
 
                     # If the active Wi-Fi connection changes while SteamCMD is
                     # running, restart SteamCMD instead of leaving the old
@@ -823,6 +872,11 @@ class Engine:
                 return None
 
             if killed or FAIL_RE.search(text) or proc.returncode not in (0, None):
+                duration = time.monotonic() - start
+                if duration < self.quick_failure_window:
+                    quick_failures += 1
+                else:
+                    quick_failures = 0
                 got = max(
                     sum_tree_bytes(self.partial_root / item.item_id),
                     sum_tree_bytes(self.installed_root / item.item_id),
@@ -832,6 +886,14 @@ class Engine:
                     "SteamCMD failure"
                 )
                 delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
+                if quick_failures >= self.quick_failure_limit:
+                    delay = max(delay, 60)
+                    self.emit(
+                        "status",
+                        f"SteamCMD failed {quick_failures} times in under {self.quick_failure_window}s — cooling down for 60s",
+                    )
+                    self._log(item.item_id, f"ADAPTIVE COOLDOWN: quick_failures={quick_failures}")
+                    quick_failures = 0
                 self.emit(
                     "status",
                     f"{reason.capitalize()} at {human_bytes(got)} — retrying in {delay}s; "
@@ -922,7 +984,7 @@ class App:
 
         workshop = ttk.LabelFrame(main, text="Workshop queue", padding=8)
         workshop.pack(fill=X, pady=(10, 0))
-        ttk.Label(workshop, text="IDs (space/comma separated)").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Label(workshop, text="IDs / Workshop URLs").grid(row=0, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(workshop, textvariable=self.ids_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
         self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
@@ -1128,7 +1190,8 @@ class App:
         style.configure("Horizontal.TProgressbar", troughcolor=input_background, background=accent)
 
     def ids(self) -> list[str]:
-        return list(dict.fromkeys(x for x in re.split(r"[\s,;]+", self.ids_var.get()) if x.isdigit()))
+        values = re.split(r"[\s,;]+", self.ids_var.get())
+        return list(dict.fromkeys(i for i in (normalize_workshop_id(x) for x in values) if i))
 
     def save(self):
         # Keep the persisted settings intentionally small and human-readable.
@@ -1233,6 +1296,9 @@ class App:
                 except Exception as exc:
                     self.events.put(("log", f"Metadata lookup failed for {iid}: {exc}"))
                     info = ItemInfo(iid)
+                if info.app and info.app != APP_ID:
+                    self.events.put(("finished", (False, f"{iid} belongs to app {info.app}, not BO3 ({APP_ID})")))
+                    continue
                 self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'}"))
                 is_fresh = iid in self.fresh_ids
                 self.engine.download(info, require_empty_start=is_fresh)
