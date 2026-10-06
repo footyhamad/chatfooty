@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "65d2efbaaf55456feee70442f28d04281cce0d7f"
+BUILD_REVISION = "2026-10-07-ffmagic-fix"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -1453,7 +1453,8 @@ class App:
                 local_revision = globals().get("BUILD_REVISION", "")
                 self.events.put((
                     "log",
-                    f"UPDATE CHECK: local={local_revision or 'unknown'} remote={remote_revision}",
+                    f"UPDATE CHECK: revision local={local_revision or 'unknown'} remote={remote_revision} "
+                    f"| blob local={current_sha[:12]} remote={remote_sha[:12]}",
                 ))
 
                 # A revision match alone is not enough: source can change
