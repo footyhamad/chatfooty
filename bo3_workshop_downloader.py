@@ -277,7 +277,40 @@ def find_steam_client_config() -> Path | None:
         Path(os.environ.get("PROGRAMFILES", "")) / "Steam" / "config" / "config.vdf",
         Path(os.environ.get("LOCALAPPDATA", "")) / "Steam" / "config" / "config.vdf",
     ]
-    return next((p for p in candidates if p.is_file()), None)
+
+    if os.name == "nt":
+        try:
+            import winreg
+            registry_candidates = (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+            )
+            for hive, key_name in registry_candidates:
+                try:
+                    with winreg.OpenKey(hive, key_name) as key:
+                        for value_name in ("SteamPath", "InstallPath"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, value_name)
+                            except OSError:
+                                continue
+                            if value:
+                                root = Path(str(value))
+                                candidates.append(root / "config" / "config.vdf")
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def read_steam_cell_id(config: Path) -> str | None:
@@ -448,14 +481,34 @@ class Engine:
             return None
 
         cmd_cfg = self.steamcmd.parent / "config" / "config.vdf"
-        if not cmd_cfg.is_file():
-            self.emit("log", f"Steam region sync: SteamCMD config not found at {cmd_cfg}")
-            return None
 
         try:
-            text = cmd_cfg.read_text(encoding="utf-8", errors="replace")
+            cmd_cfg.parent.mkdir(parents=True, exist_ok=True)
+            if cmd_cfg.is_file():
+                text = cmd_cfg.read_text(encoding="utf-8", errors="replace")
+            else:
+                # SteamCMD creates config.vdf lazily. Create only the minimal
+                # non-authenticated VDF structure needed for the CellID override.
+                text = (
+                    '"InstallConfigStore"\n'
+                    '{\n'
+                    '    "Software"\n'
+                    '    {\n'
+                    '        "Valve"\n'
+                    '        {\n'
+                    '            "Steam"\n'
+                    '            {\n'
+                    f'                "CellIDServerOverride"\t"{cell_id}"\n'
+                    f'                "CurrentCellID"\t"{cell_id}"\n'
+                    '            }\n'
+                    '        }\n'
+                    '    }\n'
+                    '}\n'
+                )
+                cmd_cfg.write_text(text, encoding="utf-8")
+                self.emit("log", f"Steam region sync: created SteamCMD config at {cmd_cfg}")
             backup = cmd_cfg.with_name("config.vdf.bo3wd-region-backup")
-            if not backup.exists():
+            if not backup.exists() and cmd_cfg.is_file():
                 shutil.copy2(cmd_cfg, backup)
 
             changed = False
