@@ -23,6 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
+BUILD_REVISION = "d260e4f226b88c18d9ba1ab242780ad6006e9da4"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -1350,12 +1351,484 @@ class App:
                 ).hexdigest()
 
                 remote_bytes, remote_sha = self.fetch_remote_source()
-                if remote_sha == current_sha:
-                    self.events.put(("update_result", (True, "Already up to date.")))
-                    return
-
                 if not remote_bytes.strip().startswith(b"#!"):
                     raise RuntimeError("GitHub returned unexpected data; update aborted")
+
+                remote_text = remote_bytes.decode("utf-8", "replace")
+                remote_revision_match = re.search(
+                    r'^BUILD_REVISION = "([^"]+)"                temp.write_bytes(remote_bytes)
+                self.events.put(("update_ready", str(temp)))
+            except Exception as exc:
+                self.events.put(("update_result", (False, str(exc))))
+
+        self.update_thread = threading.Thread(target=work, daemon=True)
+        self.update_thread.start()
+
+    def fetch_remote_source(self) -> tuple[bytes, str]:
+        """Fetch bo3_workshop_downloader.py from the main branch without requiring Git."""
+        raw_url = "https://raw.githubusercontent.com/footyhamad/chatfooty/main/bo3_workshop_downloader.py"
+        try:
+            req = urllib.request.Request(
+                raw_url,
+                headers={"User-Agent": "BO3-Workshop-Downloader-Updater/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = response.read()
+            sha = hashlib.sha1(
+                b"blob " + str(len(data)).encode() + b"\0" + data
+            ).hexdigest()
+            return data, sha
+        except Exception:
+            # The repository is private in the normal setup, so use an already
+            # authenticated GitHub CLI session as the fallback.
+            try:
+                proc = subprocess.run(
+                    [
+                        "gh", "api",
+                        "repos/footyhamad/chatfooty/contents/bo3_workshop_downloader.py",
+                        "--method", "GET",
+                        "--field", "ref=main",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    "GitHub update requires either a public repo or GitHub CLI (gh) "
+                    "authenticated to the repo."
+                ) from exc
+            if proc.returncode != 0:
+                detail = proc.stderr.decode("utf-8", "replace").strip()
+                raise RuntimeError("GitHub API update failed: " + (detail or "unknown error"))
+
+            payload = json.loads(proc.stdout.decode("utf-8"))
+            data = base64.b64decode(payload["content"])
+            remote_sha = payload.get("sha", "")
+            if not remote_sha:
+                remote_sha = hashlib.sha1(
+                    b"blob " + str(len(data)).encode() + b"\0" + data
+                ).hexdigest()
+            return data, remote_sha
+
+    def restart_after_update(self, temp_path: str):
+        self.save()
+        script = Path(__file__).resolve()
+        temp = Path(temp_path)
+        helper = script.with_name(".bo3wd_apply_update.cmd")
+        py = str(Path(sys.executable).resolve())
+        bat = (
+            "@echo off\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            f'move /Y "{temp}" "{script}" >nul\r\n'
+            f'start "" "{py}" "{script}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        try:
+            helper.write_text(bat, encoding="utf-8")
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", str(helper)],
+                cwd=str(script.parent),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.root.destroy()
+        except Exception as exc:
+            messagebox.showerror("Update", f"Updated download was prepared, but restart failed:\n{exc}")
+
+    def browse_steamcmd(self):
+        p = filedialog.askopenfilename(filetypes=[("SteamCMD", "steamcmd.exe"), ("Executable", "*.exe")])
+        if p:
+            self.steamcmd_var.set(p)
+            if not self.user_var.get():
+                self.user_var.set(detect_steam_user(Path(p)))
+
+    def browse_output(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.output_var.set(p)
+
+    def apply_theme(self):
+        style = ttk.Style(self.root)
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Metric.TLabel", font=("Segoe UI", 12, "bold"))
+        style.configure("MetricSecondary.TLabel", font=("Segoe UI", 9))
+        if not self.dark_mode_var.get():
+            style.theme_use(self.light_theme)
+            self.root.configure(background="SystemButtonFace")
+            return
+
+        style.theme_use("clam")
+        background = "#1e1f22"
+        surface = "#2b2d31"
+        input_background = "#313338"
+        foreground = "#f2f3f5"
+        accent = "#5865f2"
+        self.root.configure(background=background)
+        style.configure(".", background=background, foreground=foreground)
+        style.configure("Title.TLabel", background=background, foreground=foreground)
+        style.configure("Subtitle.TLabel", background=background, foreground="#aeb4c0")
+        style.configure("Status.TLabel", background=background, foreground="#7dd3fc")
+        style.configure("Section.TLabel", background=background, foreground=foreground)
+        style.configure("Metric.TLabel", background=background, foreground=foreground)
+        style.configure("MetricSecondary.TLabel", background=background, foreground="#b9c0cc")
+        style.configure("TFrame", background=background)
+        style.configure("TLabel", background=background, foreground=foreground)
+        style.configure("TLabelframe", background=background, foreground=foreground)
+        style.configure("TLabelframe.Label", background=background, foreground=foreground)
+        style.configure("TEntry", fieldbackground=input_background, foreground=foreground)
+        style.configure("TCheckbutton", background=background, foreground=foreground)
+        style.configure("TButton", background=surface, foreground=foreground, padding=(8, 4))
+        style.map("TButton", background=[("active", accent), ("pressed", "#4752c4")])
+        style.configure("Treeview", background=input_background, fieldbackground=input_background, foreground=foreground)
+        style.configure("Treeview.Heading", background=surface, foreground=foreground)
+        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", foreground)])
+        style.configure("Horizontal.TProgressbar", troughcolor=input_background, background=accent)
+
+    def ids(self) -> list[str]:
+        values = re.split(r"[\s,;]+", self.ids_var.get())
+        return list(dict.fromkeys(i for i in (normalize_workshop_id(x) for x in values) if i))
+
+    def save(self):
+        # Keep the persisted settings intentionally small and human-readable.
+        write_json(self.cfg_path, {
+            "steamcmd": self.steamcmd_var.get().strip(),
+            "steam_user": self.user_var.get().strip(),
+            "output_dir": self.output_var.get().strip(),
+            "max_retries": int(self.retry_var.get() or 0),
+            "watchdog_seconds": int(self.watchdog_var.get() or 420),
+            "stall_seconds": int(self.stall_var.get() or 75),
+            "poll_seconds": 1.0,
+            "auto_export": bool(self.auto_export_var.get()),
+            "inherit_steam_region": bool(self.inherit_region_var.get()),
+            "max_throughput": bool(self.max_throughput_var.get()),
+            "last_started_ids": self.last_started_ids,
+            "dark_mode": bool(self.dark_mode_var.get()),
+            "build_revision": BUILD_REVISION,
+        })
+
+    def lookup(self):
+        ids = self.ids()
+        if not ids:
+            messagebox.showerror("Workshop", "Enter a numeric Workshop ID.")
+            return
+        if self.inherit_region_var.get():
+            steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+            if steamcmd.is_file():
+                lookup_engine = Engine(
+                    steamcmd, self.user_var.get().strip() or detect_steam_user(steamcmd),
+                    Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
+                    retries=0, watchdog=420, stall_seconds=75, poll=1.0,
+                    auto_export=False, retry_backoff_seconds=5, max_throughput=False,
+                    emit=lambda kind, payload: self.events.put((kind, payload)),
+                )
+                lookup_engine.sync_steam_region()
+
+        def work():
+            for iid in ids:
+                try:
+                    info = WorkshopAPI.get(iid)
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                except Exception as exc:
+                    self.events.put(("log", f"Lookup {iid} failed: {exc}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+        user = self.user_var.get().strip() or detect_steam_user(steamcmd)
+        out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
+        ids = self.ids()
+        if not steamcmd.is_file():
+            messagebox.showerror("SteamCMD", "Select the SteamCMD executable.")
+            return
+        if not user:
+            messagebox.showerror("Steam login", "No cached login found. Log in once manually with this SteamCMD install.")
+            return
+        if not ids:
+            messagebox.showerror("Workshop", "Enter at least one numeric Workshop ID.")
+            return
+        try:
+            retries = int(self.retry_var.get())
+            watchdog = int(self.watchdog_var.get())
+            stall_seconds = int(self.stall_var.get())
+            if stall_seconds < 30:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Settings", "Retries, watchdog, and stall timeout must be valid integers (stall >= 30).")
+            return
+
+        # Persist only IDs that have actually been started, rather than saving
+        # transient edits that were never submitted to SteamCMD.
+        self.last_started_ids = " ".join(ids)
+        self.save()
+        self.log_box.delete(*self.log_box.get_children())
+        self.bar.configure(value=0)
+        self.status_var.set("Preparing…")
+        self.start_btn.configure(state="disabled")
+        self.clear_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        self.engine = Engine(
+            steamcmd, user, out,
+            retries=retries, watchdog=watchdog,
+            stall_seconds=stall_seconds,
+            poll=1.0, auto_export=self.auto_export_var.get(),
+            retry_backoff_seconds=5, max_throughput=self.max_throughput_var.get(),
+            emit=lambda kind, payload: self.events.put((kind, payload)),
+        )
+        self.events.put(("log", "MAX THROUGHPUT: " + ("ENABLED" if self.max_throughput_var.get() else "disabled")))
+
+        if self.inherit_region_var.get():
+            # SteamCMD has no documented region selector; mirror the normal
+            # Steam client's CellID as a best-effort CDN-region preference.
+            self.engine.sync_steam_region()
+
+        def work():
+            for iid in ids:
+                if self.engine.stop_event.is_set():
+                    break
+                try:
+                    info = WorkshopAPI.get(iid)
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                except Exception as exc:
+                    self.events.put(("log", f"Metadata lookup failed for {iid}: {exc}"))
+                    info = ItemInfo(iid)
+                if info.app and info.app != APP_ID:
+                    self.events.put(("finished", (False, f"{iid} belongs to app {info.app}, not BO3 ({APP_ID})")))
+                    continue
+                self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'}"))
+                is_fresh = iid in self.fresh_ids
+                self.engine.download(info, require_empty_start=is_fresh)
+                # After the first launch, a failed download is resumable by design.
+                self.fresh_ids.discard(iid)
+            self.events.put(("all_done", None))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def clear_old_data(self):
+        # This button intentionally affects only the Workshop IDs in the queue.
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Clear old data", "Stop the current download before clearing old data.")
+            return
+        ids = self.ids()
+        if not ids:
+            messagebox.showerror("Clear old data", "Enter at least one numeric Workshop ID.")
+            return
+        if not messagebox.askyesno(
+            "Clear old data",
+            "Delete ALL old download data for:\n\n" + ", ".join(ids) +
+            "\n\nThis removes SteamCMD partial/installed data AND exported/ported copies for these IDs.",
+            icon="warning",
+        ):
+            return
+
+        steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+        if not steamcmd.is_file():
+            messagebox.showerror("SteamCMD", "Select the SteamCMD executable first.")
+            return
+
+        user = self.user_var.get().strip() or detect_steam_user(steamcmd)
+        out = Path(self.output_var.get().strip().strip('"') or "BO3-Workshop")
+        engine = Engine(
+            steamcmd, user, out,
+            retries=0, watchdog=420, stall_seconds=75, poll=1.0,
+            auto_export=False, retry_backoff_seconds=5, max_throughput=False,
+            emit=lambda kind, payload: self.events.put((kind, payload)),
+        )
+        try:
+            removed = sum(engine.clear_item_data(iid) for iid in ids)
+            self.fresh_ids.update(ids)
+            self.bar.configure(value=0)
+            self.progress_var.set("0 B / unknown")
+            self.speed_var.set("Download: 0 B/s")
+            self.disk_speed_var.set("Disk: 0 B/s")
+            self.eta_var.set("ETA --:--")
+            self.status_var.set(
+                f"Fresh-download cleanup complete: removed {removed} old folder(s); start is verified at 0 B"
+            )
+        except Exception as exc:
+            messagebox.showerror("Clear old data", str(exc))
+
+    def stop(self):
+        if self.engine:
+            self.engine.stop()
+        self.status_var.set("Stopping… partial data will be preserved")
+
+    def copy_log(self, _event=None):
+        selected = self.log_box.selection()
+        if not selected:
+            return "break"
+        text = "\n".join(
+            str(self.log_box.item(i, "values")[0])
+            for i in selected
+            if self.log_box.item(i, "values")
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        return "break"
+
+    def select_all_log(self, _event=None):
+        self.log_box.selection_set(self.log_box.get_children())
+        return "break"
+
+    def log_context_menu(self, event):
+        try:
+            row = self.log_box.identify_row(event.y)
+            if row and row not in self.log_box.selection():
+                self.log_box.selection_set(row)
+            self.log_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_menu.grab_release()
+
+    def add_log(self, line: str):
+        self.log_box.insert("", END, values=(line,))
+        items = self.log_box.get_children()
+        if items:
+            self.log_box.see(items[-1])
+        if len(items) > 2000:
+            self.log_box.delete(items[0])
+
+    def poll_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+
+                # Normalize both the current (kind, payload) format and older
+                # builds that queued (kind, value1, value2, ...) directly.
+                if not isinstance(event, tuple) or len(event) < 2:
+                    self.add_log(f"Internal event ignored: {event!r}")
+                    continue
+                kind = event[0]
+                payload = event[1] if len(event) == 2 else event[1:]
+
+                if kind == "log":
+                    self.add_log(str(payload))
+                elif kind == "status":
+                    message = str(payload)
+                    self.status_var.set(message)
+                    self.add_log("STATUS: " + message)
+                elif kind == "info":
+                    message = str(payload)
+                    self.info_var.set(message)
+                    self.add_log("INFO: " + message)
+                elif kind == "progress":
+                    p = payload
+                    self.bar.configure(value=min(100.0, max(0.0, p["pct"] or 0)))
+                    total = human_bytes(p["total"]) if p["total"] else "unknown"
+                    pct = f" ({p['pct']:.2f}%)" if p["pct"] is not None else ""
+                    self.progress_var.set(f"{human_bytes(p['bytes'])} / {total}{pct}")
+                    if p.get("network_available"):
+                        self.speed_var.set("Download: " + human_speed(p["speed"]))
+                    else:
+                        self.speed_var.set("Download: unavailable")
+                    disk_speed = p.get("disk_speed", 0.0)
+                    self.disk_speed_var.set("Disk write: " + human_speed(disk_speed))
+                    self.eta_var.set("ETA " + eta_text(p["eta"]))
+                    self.attempt_var.set(f"Attempt {p['attempt']}")
+                    elapsed = max(0.0, float(p.get("elapsed", 0.0)))
+                    elapsed_text = eta_text(elapsed)
+                    total_text = human_bytes(p["total"]) if p["total"] else "unknown"
+                    progress_message = (
+                        f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                        f" ({p['pct']:.2f}%)"
+                        if p["pct"] is not None
+                        else f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                    )
+                    progress_message += (
+                        f" | network {human_speed(p['speed'])}"
+                        f" | disk {human_speed(disk_speed)}"
+                        f" | ETA {eta_text(p['eta'])}"
+                        f" | attempt {p['attempt']}"
+                        f" | elapsed {elapsed_text}"
+                    )
+                    self.add_log(progress_message)
+                elif kind == "export_progress":
+                    b, t, name = payload
+                    self.bar.configure(value=(b / t * 100.0) if t else 0)
+                    self.progress_var.set(f"Export {human_bytes(b)} / {human_bytes(t)}")
+                    export_message = f"Exporting {name}: {human_bytes(b)} / {human_bytes(t)}"
+                    self.status_var.set(export_message)
+                    self.add_log("EXPORT: " + export_message)
+                elif kind == "finished":
+                    ok, msg = payload
+                    result_text = ("DONE: " if ok else "FAILED: ") + str(msg)
+                    self.status_var.set(result_text)
+                    self.add_log("RESULT: " + result_text)
+                elif kind == "update_ready":
+                    self.status_var.set("Update downloaded. Restarting…")
+                    self.update_btn.configure(state="disabled")
+                    self.root.after(700, lambda p=payload: self.restart_after_update(p))
+                elif kind == "update_result":
+                    ok, msg = payload
+                    self.update_btn.configure(state="normal")
+                    self.status_var.set(str(msg) if ok else "Update failed")
+                    if not ok:
+                        messagebox.showerror("Update", str(msg))
+                elif kind == "all_done":
+                    self.start_btn.configure(state="normal")
+                    self.clear_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    if self.status_var.get().startswith("Preparing") or self.status_var.get().startswith("Downloading"):
+                        self.status_var.set("Queue finished")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll_events)
+
+    def close(self):
+        if self.engine:
+            self.engine.stop()
+        try:
+            self.save()
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+def main():
+    root = Tk()
+    try:
+        ttk.Style().theme_use("vista")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        error = traceback.format_exc()
+        try:
+            Path(__file__).with_name("startup.log").write_text(error, encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("BO3 Workshop Downloader startup error", error)
+        except Exception:
+            pass
+        raise
+,
+                    remote_text,
+                    re.M,
+                )
+                remote_revision = remote_revision_match.group(1) if remote_revision_match else remote_sha
+                local_revision = globals().get("BUILD_REVISION", "")
+                self.events.put(("log", f"UPDATE CHECK: local={local_revision or 'unknown'} remote={remote_revision}"))
+
+                # A missing local build revision means this is an older build.
+                # Revision comparison takes precedence over byte hashing.
+                if local_revision and remote_revision == local_revision:
+                    self.events.put(("update_result", (True, f"Already up to date ({local_revision[:8]}).")))
+                    return
+                if not local_revision and remote_sha == current_sha:
+                    self.events.put(("update_result", (True, "Already up to date.")))
+                    return
 
                 temp = script.with_suffix(script.suffix + ".update")
                 temp.write_bytes(remote_bytes)
