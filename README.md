@@ -12,9 +12,14 @@ The GUI reports progress independently by summing the actual files under SteamCM
 
 - BO3 AppID 311210
 - SteamCMD only; no custom Steam CDN implementation
+- Accepts Workshop IDs or full Steam Workshop URLs
+- BO3 AppID validation prevents downloading an item from another Steam app
 - Automatic retry/resume after timeout or failure
+- Watches SteamCMD content logs for failures in addition to stdout
+- Adaptive cooldown after repeated fast failures, without deleting partial data
 - Never clears partial Workshop download data on retry
 - Real progress and a filesystem-based ETA, separate from system network diagnostics
+- Smoothed network diagnostics and Wi-Fi/BSSID change detection with safe SteamCMD restart
 - Workshop metadata lookup (title and expected size)
 - Multiple Workshop IDs in one queue
 - Optional export/copy to a custom output directory
