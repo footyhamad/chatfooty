@@ -37,6 +37,7 @@ DEFAULTS = {
     "retry_backoff_seconds": 5,
     "quick_failure_limit": 3,
     "quick_failure_window": 20,
+    "max_throughput": True,
     "last_started_ids": "3296316642",
     "dark_mode": False,
 }
@@ -364,7 +365,8 @@ class WorkshopAPI:
 class Engine:
     def __init__(self, steamcmd: Path, user: str, out: Path, *,
                  retries: int, watchdog: int, stall_seconds: int,
-                 poll: float, auto_export: bool, retry_backoff_seconds: int, emit):
+                 poll: float, auto_export: bool, retry_backoff_seconds: int,
+                 max_throughput: bool, emit):
         self.steamcmd = steamcmd
         self.user = user
         self.out = out
@@ -374,6 +376,7 @@ class Engine:
         self.poll = max(0.5, poll)
         self.auto_export = auto_export
         self.retry_backoff_seconds = max(1, retry_backoff_seconds)
+        self.max_throughput = bool(max_throughput)
         self.quick_failure_limit = 3
         self.quick_failure_window = 20
         self.emit = emit
@@ -383,6 +386,55 @@ class Engine:
         self.installed_root = root / "steamapps" / "workshop" / "content" / APP_ID
         self.log_root = out / "_logs"
         self.content_log = root / "logs" / "content_log.txt"
+
+    def _remove_download_throttle(self) -> bool:
+        """Remove a known Steam client download throttle from SteamCMD config."""
+        if not self.max_throughput:
+            return False
+        cfg = self.steamcmd.parent / "config" / "config.vdf"
+        if not cfg.is_file():
+            self.emit("log", "MAX THROUGHPUT: SteamCMD config.vdf not found; no throttle change")
+            return False
+        try:
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r'("DownloadThrottleKbps"\s+")([^"]+)(")', text)
+            if not match:
+                self.emit("log", "MAX THROUGHPUT: no DownloadThrottleKbps setting present; SteamCMD will auto-manage connections")
+                return False
+            current = match.group(2)
+            if current == "0":
+                self.emit("log", "MAX THROUGHPUT: Steam download throttle already disabled (0 KB/s)")
+                return True
+            backup = cfg.with_name("config.vdf.bo3wd-throughput-backup")
+            if not backup.exists():
+                shutil.copy2(cfg, backup)
+            text = text[:match.start(2)] + "0" + text[match.end(2):]
+            cfg.write_text(text, encoding="utf-8")
+            self.emit("log", f"MAX THROUGHPUT: disabled SteamCMD download throttle ({current} -> 0 KB/s)")
+            return True
+        except OSError as exc:
+            self.emit("log", f"MAX THROUGHPUT: could not change download throttle: {exc}")
+            return False
+
+    def _tune_process(self, proc: subprocess.Popen) -> None:
+        """Give SteamCMD enough CPU/IO scheduling priority to avoid local contention."""
+        if not self.max_throughput:
+            return
+        try:
+            import psutil  # type: ignore
+            process = psutil.Process(proc.pid)
+            if os.name == "nt":
+                process.nice(psutil.HIGH_PRIORITY_CLASS)
+                try:
+                    process.ionice(psutil.IOPRIO_HIGH)
+                except Exception:
+                    pass
+                self.emit("log", "MAX THROUGHPUT: SteamCMD priority=HIGH; I/O priority=HIGH")
+            else:
+                self.emit("log", "MAX THROUGHPUT: SteamCMD CPU scheduling left unchanged on non-Windows")
+        except Exception as exc:
+            self.emit("log", f"MAX THROUGHPUT: process tuning skipped: {exc}")
+
 
     def sync_steam_region(self) -> str | None:
         """Mirror the normal Steam client's selected CDN region into SteamCMD."""
@@ -816,6 +868,9 @@ class Engine:
                 bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+
+            self._remove_download_throttle()
+            self._tune_process(proc)
 
             start = time.monotonic()
             output: list[str] = []
@@ -1409,7 +1464,7 @@ class App:
                     steamcmd, self.user_var.get().strip() or detect_steam_user(steamcmd),
                     Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
                     retries=0, watchdog=420, stall_seconds=75, poll=1.0,
-                    auto_export=False, retry_backoff_seconds=5,
+                    auto_export=False, retry_backoff_seconds=5, max_throughput=True,
                     emit=lambda kind, payload: self.events.put((kind, payload)),
                 )
                 lookup_engine.sync_steam_region()
@@ -1465,7 +1520,7 @@ class App:
             retries=retries, watchdog=watchdog,
             stall_seconds=stall_seconds,
             poll=1.0, auto_export=self.auto_export_var.get(),
-            retry_backoff_seconds=5,
+            retry_backoff_seconds=5, max_throughput=True,
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
 
