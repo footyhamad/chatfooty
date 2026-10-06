@@ -1,51 +1,84 @@
 Option Explicit
 
-Dim shell, fso, scriptPath, pythonw, execResult, line, logPath
+Dim shell, fso, scriptDir, scriptPath, interpreter, logPath, pathValue, parts, i, candidate, lf
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
-scriptPath = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "bo3_workshop_downloader.py")
-logPath = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "launcher.log")
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+scriptPath = fso.BuildPath(scriptDir, "bo3_workshop_downloader.py")
+logPath = fso.BuildPath(scriptDir, "launcher.log")
+interpreter = ""
 
-pythonw = ""
-
+' Find pythonw.exe/pyw.exe directly from PATH. Do NOT invoke cmd.exe/where:
+' that was causing visible console flashes on some Windows setups.
 On Error Resume Next
-Set execResult = shell.Exec("cmd.exe /d /c where pyw.exe")
-If Err.Number = 0 Then
-    If Not execResult.StdOut.AtEndOfStream Then
-        line = Trim(execResult.StdOut.ReadLine())
-        If line <> "" Then pythonw = line
-    End If
-End If
-Err.Clear
-
-If pythonw = "" Then
-    Set execResult = shell.Exec("cmd.exe /d /c where pythonw.exe")
-    If Err.Number = 0 Then
-        If Not execResult.StdOut.AtEndOfStream Then
-            line = Trim(execResult.StdOut.ReadLine())
-            If line <> "" Then pythonw = line
-        End If
-    End If
-End If
-Err.Clear
+pathValue = shell.Environment("Process")("PATH")
 On Error GoTo 0
 
-If pythonw = "" Then
-    Dim lf
+If pathValue <> "" Then
+    parts = Split(pathValue, ";")
+    For i = 0 To UBound(parts)
+        candidate = Trim(parts(i))
+        If candidate <> "" Then
+            If Right(candidate, 1) = "" Then
+                candidate = Left(candidate, Len(candidate) - 1)
+            End If
+
+            If fso.FileExists(candidate & "pythonw.exe") Then
+                interpreter = candidate & "pythonw.exe"
+                Exit For
+            End If
+
+            If fso.FileExists(candidate & "pyw.exe") Then
+                interpreter = candidate & "pyw.exe"
+                Exit For
+            End If
+        End If
+    Next
+End If
+
+' Microsoft Store Python can expose python.exe through WindowsApps without a
+' pythonw alias being present. Locate python.exe in PATH and launch it hidden
+' as a last resort.
+If interpreter = "" And pathValue <> "" Then
+    parts = Split(pathValue, ";")
+    For i = 0 To UBound(parts)
+        candidate = Trim(parts(i))
+        If candidate <> "" Then
+            If Right(candidate, 1) = "" Then
+                candidate = Left(candidate, Len(candidate) - 1)
+            End If
+            If fso.FileExists(candidate & "python.exe") Then
+                interpreter = candidate & "python.exe"
+                Exit For
+            End If
+        End If
+    Next
+End If
+
+If interpreter = "" Then
     Set lf = fso.OpenTextFile(logPath, 8, True)
-    lf.WriteLine Now & " - Could not find pyw.exe or pythonw.exe on PATH."
+    lf.WriteLine Now & " - Could not find pythonw.exe, pyw.exe, or python.exe on PATH."
     lf.Close
-    MsgBox "Python windowless interpreter was not found." & vbCrLf & _
+    MsgBox "Python could not be found." & vbCrLf & _
            "See launcher.log for details.", vbCritical, "BO3 Workshop Downloader"
     WScript.Quit 1
 End If
 
+If Not fso.FileExists(scriptPath) Then
+    Set lf = fso.OpenTextFile(logPath, 8, True)
+    lf.WriteLine Now & " - Script not found: " & scriptPath
+    lf.Close
+    MsgBox "Downloader script was not found:" & vbCrLf & _
+           scriptPath, vbCritical, "BO3 Workshop Downloader"
+    WScript.Quit 1
+End If
+
 On Error Resume Next
-shell.Run """" & pythonw & """ """ & scriptPath & """", 0, False
+shell.Run """" & interpreter & """ """ & scriptPath & """", 0, False
 If Err.Number <> 0 Then
     Set lf = fso.OpenTextFile(logPath, 8, True)
-    lf.WriteLine Now & " - Start failed: " & Err.Description
+    lf.WriteLine Now & " - Start failed using " & interpreter & ": " & Err.Description
     lf.Close
     MsgBox "Could not start the downloader." & vbCrLf & _
            "See launcher.log for details.", vbCritical, "BO3 Workshop Downloader"
