@@ -773,7 +773,9 @@ class Engine:
             self.emit("log", f"Could not scan Workshop fastfiles: {exc}")
         return invalid
 
-    def _repair_invalid_bo3_fastfiles(self, invalid: list[tuple[Path, bytes]]) -> int:
+    def _repair_invalid_bo3_fastfiles(
+        self, item_id: str, invalid: list[tuple[Path, bytes]]
+    ) -> int:
         """Remove only invalid installed .ff files so SteamCMD is forced to redownload them."""
         removed = 0
         for path, header in invalid:
@@ -782,7 +784,7 @@ class Engine:
                     path.unlink()
                     removed += 1
                     self._log(
-                        path.name,
+                        item_id,
                         f"INVALID FASTFILE REMOVED: {path} header={header.hex() or 'unreadable'}",
                     )
                     self.emit(
@@ -1191,7 +1193,7 @@ class Engine:
                     invalid_fastfiles = self._invalid_bo3_fastfiles(installed)
                     if invalid_fastfiles:
                         try:
-                            removed = self._repair_invalid_bo3_fastfiles(invalid_fastfiles)
+                            removed = self._repair_invalid_bo3_fastfiles(item.item_id, invalid_fastfiles)
                             self.emit(
                                 "status",
                                 f"Integrity repair removed {removed} invalid fastfile(s); "
