@@ -103,6 +103,15 @@ def sum_tree_bytes(root: Path) -> int:
     return total
 
 
+def process_write_bytes(pid: int) -> int | None:
+    """Return cumulative bytes written by a process when available."""
+    try:
+        import psutil  # type: ignore
+        return int(psutil.Process(pid).io_counters().write_bytes)
+    except Exception:
+        return None
+
+
 def system_network_bytes() -> int | None:
     """Return cumulative system network traffic in bytes.
 
@@ -501,7 +510,8 @@ class Engine:
                   prev_b: int, prev_t: float, last_net_b: int | None,
                   last_net_t: float, net_samples: list[tuple[float, int]],
                   progress_samples: list[tuple[float, int]],
-                  network_speed_ema: float, disk_speed_ema: float):
+                  network_speed_ema: float, disk_speed_ema: float,
+                  steamcmd_pid: int, disk_io_samples: list[tuple[float, int]]):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
@@ -509,14 +519,26 @@ class Engine:
         dt = max(0.5, now - prev_t)
         db = max(0, current - prev_b)
 
-        # SteamCMD writes data in bursts, so filesystem growth is useful as a
-        # diagnostic but is NOT the network download rate.
+        # Folder-size growth is not the same thing as disk throughput: SteamCMD
+        # can write staging/temp data that is not yet visible in the Workshop tree.
+        # Prefer SteamCMD process write I/O when psutil can report it.
         disk_raw_speed = db / dt if db > 0 else 0.0
-        # SteamCMD writes in bursts. Smooth filesystem-growth telemetry so the
-        # UI does not oscillate between a real rate and 0 B/s.
+        process_written = process_write_bytes(steamcmd_pid)
+        if process_written is not None:
+            disk_io_samples.append((now, process_written))
+            cutoff_disk = now - 5.0
+            disk_io_samples[:] = [
+                (t, b) for t, b in disk_io_samples if t >= cutoff_disk
+            ]
+            if len(disk_io_samples) >= 2:
+                t0, b0 = disk_io_samples[0]
+                write_elapsed = max(0.5, now - t0)
+                disk_raw_speed = max(0.0, (process_written - b0) / write_elapsed)
+
+        # Keep the displayed disk number stable while preserving responsiveness.
         disk_speed = (
             disk_raw_speed if disk_speed_ema <= 0
-            else (disk_speed_ema * 0.75) + (disk_raw_speed * 0.25)
+            else (disk_speed_ema * 0.80) + (disk_raw_speed * 0.20)
         )
         disk_speed_ema = disk_speed
 
@@ -711,6 +733,7 @@ class Engine:
         last_net_t = prev_t
         net_samples: list[tuple[float, int]] = []
         progress_samples: list[tuple[float, int]] = [(prev_t, prev_b)]
+        disk_io_samples: list[tuple[float, int]] = []
         network_speed_ema = 0.0
         disk_speed_ema = 0.0
         network_signature = network_connection_signature()
@@ -819,7 +842,7 @@ class Engine:
                     prev_b, prev_t, last_net_b, last_net_t, network_speed_ema, disk_speed_ema = self._progress(
                         item, attempt, start, prev_b, prev_t,
                         last_net_b, last_net_t, net_samples, progress_samples,
-                        network_speed_ema, disk_speed_ema,
+                        network_speed_ema, disk_speed_ema, proc.pid, disk_io_samples,
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
