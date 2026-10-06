@@ -761,6 +761,14 @@ class Engine:
                     if prev_b > previous_b:
                         observed_b = prev_b
                         last_activity = now
+                        if int(now - start) % 10 < max(1, int(self.poll)):
+                            self.emit(
+                                "log",
+                                f"DOWNLOAD: {human_bytes(prev_b)} / "
+                                f"{human_bytes(item.size) if item.size else 'unknown'} | "
+                                f"network {human_speed(network_speed_ema)} | "
+                                f"disk write {human_speed(disk_speed_ema)}",
+                            )
 
                     # SteamCMD writes detailed transfer and validation updates
                     # to content_log.txt even when its stdout is quiet.
