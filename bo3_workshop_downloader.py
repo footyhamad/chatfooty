@@ -1371,9 +1371,9 @@ class App:
                     f"UPDATE CHECK: local={local_revision or 'unknown'} remote={remote_revision}",
                 ))
 
-                # A missing local build revision means this is an older build.
-                # Revision comparison takes precedence over byte hashing.
-                if local_revision and remote_revision == local_revision:
+                # A revision match alone is not enough: source can change
+                # without a revision bump. Require the Git blob hash to match too.
+                if local_revision and remote_revision == local_revision and remote_sha == current_sha:
                     self.events.put((
                         "update_result",
                         (True, f"Already up to date ({local_revision[:8]})."),
