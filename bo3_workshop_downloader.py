@@ -31,7 +31,7 @@ DEFAULTS = {
     "max_retries": 0,
     "watchdog_seconds": 420,
     "stall_seconds": 75,
-    "poll_seconds": 2.0,
+    "poll_seconds": 1.0,
     "auto_export": True,
     "inherit_steam_region": True,
     "retry_backoff_seconds": 5,
@@ -407,6 +407,16 @@ class Engine:
         # download cache and the installed Workshop copy. Clear BOTH so
         # SteamCMD cannot silently resume the old bytes.
         removed = 0
+        state_patch = self.partial_root / f"state_{APP_ID}_{APP_ID}_{item_id}.patch"
+        if state_patch.exists():
+            try:
+                state_patch.unlink()
+            except OSError as exc:
+                raise RuntimeError(f"SteamCMD state file could not be removed: {state_patch} ({exc})") from exc
+            if state_patch.exists():
+                raise RuntimeError(f"SteamCMD state file could not be fully removed: {state_patch}")
+            removed += 1
+            self.emit("log", f"Cleared SteamCMD Workshop state: {state_patch}")
         for root in (self.partial_root, self.installed_root):
             p = root / item_id
             if p.exists():
@@ -490,6 +500,7 @@ class Engine:
     def _progress(self, item: ItemInfo, attempt: int, started: float,
                   prev_b: int, prev_t: float, last_net_b: int | None,
                   last_net_t: float, net_samples: list[tuple[float, int]],
+                  progress_samples: list[tuple[float, int]],
                   network_speed_ema: float, disk_speed_ema: float):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
@@ -508,6 +519,19 @@ class Engine:
             else (disk_speed_ema * 0.75) + (disk_raw_speed * 0.25)
         )
         disk_speed_ema = disk_speed
+
+        # Use actual Workshop byte growth for ETA. Keep a rolling window so
+        # bursty filesystem flushes do not make ETA explode into hours.
+        progress_samples.append((now, current))
+        cutoff = now - 20.0
+        progress_samples[:] = [(t, b) for t, b in progress_samples if t >= cutoff]
+        workshop_speed = 0.0
+        if len(progress_samples) >= 2:
+            t0, b0 = progress_samples[0]
+            elapsed = max(1.0, now - t0)
+            workshop_speed = max(0.0, (current - b0) / elapsed)
+        if workshop_speed <= 0.0 and current > prev_b:
+            workshop_speed = db / dt
 
         # PowerShell is only a fallback for machines without psutil and is
         # relatively expensive to launch. Sample the system counter every 3s.
@@ -544,9 +568,9 @@ class Engine:
         else:
             network_speed = network_speed_ema if network_speed_ema > 0 else 0.0
 
-        # System network traffic is only a diagnostic. Use actual Workshop
-        # file growth for the ETA so unrelated downloads cannot make it lie.
-        eta_speed = disk_speed
+        # System network and disk-write rates are diagnostics. ETA uses the
+        # rolling Workshop byte-growth rate, which tracks actual download progress.
+        eta_speed = workshop_speed
         pct = (current / item.size * 100.0) if item.size else None
         eta = ((item.size - current) / eta_speed) if item.size and eta_speed > 0 else None
         self.emit("progress", {
@@ -640,13 +664,25 @@ class Engine:
     def _clear_partial_item(self, item_id: str) -> int:
         """Delete SteamCMD's partial download for one Workshop item only."""
         path = self.partial_root / item_id
-        if not path.exists():
-            return 0
-        size = sum_tree_bytes(path)
-        shutil.rmtree(path, ignore_errors=True)
+        state_patch = self.partial_root / f"state_{APP_ID}_{APP_ID}_{item_id}.patch"
+        size = 0
+
         if path.exists():
-            raise RuntimeError(f"Could not remove partial Workshop data: {path}")
-        self._log(item_id, f"DELETED PARTIAL DATA: {human_bytes(size)} from {path}")
+            size = sum_tree_bytes(path)
+            shutil.rmtree(path, ignore_errors=True)
+            if path.exists():
+                raise RuntimeError(f"Could not remove partial Workshop data: {path}")
+            self._log(item_id, f"DELETED PARTIAL DATA: {human_bytes(size)} from {path}")
+
+        if state_patch.exists():
+            try:
+                state_patch.unlink()
+            except OSError as exc:
+                raise RuntimeError(f"Could not remove SteamCMD state data: {state_patch} ({exc})") from exc
+            if state_patch.exists():
+                raise RuntimeError(f"Could not remove SteamCMD state data: {state_patch}")
+            self._log(item_id, f"DELETED STEAMCMD STATE: {state_patch}")
+
         return size
 
     def _kill(self, proc: subprocess.Popen) -> None:
@@ -674,6 +710,7 @@ class Engine:
         last_net_b = system_network_bytes()
         last_net_t = prev_t
         net_samples: list[tuple[float, int]] = []
+        progress_samples: list[tuple[float, int]] = [(prev_t, prev_b)]
         network_speed_ema = 0.0
         disk_speed_ema = 0.0
         network_signature = network_connection_signature()
@@ -781,7 +818,8 @@ class Engine:
                     previous_b = observed_b
                     prev_b, prev_t, last_net_b, last_net_t, network_speed_ema, disk_speed_ema = self._progress(
                         item, attempt, start, prev_b, prev_t,
-                        last_net_b, last_net_t, net_samples, network_speed_ema, disk_speed_ema,
+                        last_net_b, last_net_t, net_samples, progress_samples,
+                        network_speed_ema, disk_speed_ema,
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
@@ -1293,7 +1331,7 @@ class App:
             "max_retries": int(self.retry_var.get() or 0),
             "watchdog_seconds": int(self.watchdog_var.get() or 420),
             "stall_seconds": int(self.stall_var.get() or 75),
-            "poll_seconds": 2.0,
+            "poll_seconds": 1.0,
             "auto_export": bool(self.auto_export_var.get()),
             "inherit_steam_region": bool(self.inherit_region_var.get()),
             "last_started_ids": self.last_started_ids,
@@ -1311,7 +1349,7 @@ class App:
                 lookup_engine = Engine(
                     steamcmd, self.user_var.get().strip() or detect_steam_user(steamcmd),
                     Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
-                    retries=0, watchdog=420, stall_seconds=75, poll=2.0,
+                    retries=0, watchdog=420, stall_seconds=75, poll=1.0,
                     auto_export=False, retry_backoff_seconds=5,
                     emit=lambda kind, payload: self.events.put((kind, payload)),
                 )
@@ -1367,7 +1405,7 @@ class App:
             steamcmd, user, out,
             retries=retries, watchdog=watchdog,
             stall_seconds=stall_seconds,
-            poll=2.0, auto_export=self.auto_export_var.get(),
+            poll=1.0, auto_export=self.auto_export_var.get(),
             retry_backoff_seconds=5,
             emit=lambda kind, payload: self.events.put((kind, payload)),
         )
