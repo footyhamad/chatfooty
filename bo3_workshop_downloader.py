@@ -615,6 +615,18 @@ class Engine:
             )
         return dest
 
+    def _clear_partial_item(self, item_id: str) -> int:
+        """Delete SteamCMD's partial download for one Workshop item only."""
+        path = self.partial_root / item_id
+        if not path.exists():
+            return 0
+        size = sum_tree_bytes(path)
+        shutil.rmtree(path, ignore_errors=True)
+        if path.exists():
+            raise RuntimeError(f"Could not remove partial Workshop data: {path}")
+        self._log(item_id, f"DELETED PARTIAL DATA: {human_bytes(size)} from {path}")
+        return size
+
     def _kill(self, proc: subprocess.Popen) -> None:
         if proc.poll() is not None:
             return
@@ -887,11 +899,16 @@ class Engine:
                 )
                 delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
                 if quick_failures >= self.quick_failure_limit:
+                    try:
+                        deleted = self._clear_partial_item(item.item_id)
+                        self.emit(
+                            "status",
+                            f"SteamCMD failed {quick_failures} times quickly — deleted {human_bytes(deleted)} of partial data before retry",
+                        )
+                    except Exception as exc:
+                        self._log(item.item_id, f"PARTIAL DELETE FAILED: {exc}")
+                        self.emit("status", f"Could not delete partial data: {exc}")
                     delay = max(delay, 60)
-                    self.emit(
-                        "status",
-                        f"SteamCMD failed {quick_failures} times in under {self.quick_failure_window}s — cooling down for 60s",
-                    )
                     self._log(item.item_id, f"ADAPTIVE COOLDOWN: quick_failures={quick_failures}")
                     quick_failures = 0
                 self.emit(
