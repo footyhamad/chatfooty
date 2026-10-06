@@ -457,6 +457,20 @@ class Engine:
         except OSError:
             return ""
 
+    def _content_log_new_data(self, offset: int) -> tuple[str, int]:
+        """Read only newly appended SteamCMD content-log data."""
+        try:
+            with self.content_log.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size < offset:
+                    offset = 0
+                f.seek(offset, os.SEEK_SET)
+                data = f.read().decode("utf-8", "replace")
+                return data, size
+        except OSError:
+            return "", offset
+
     def _steamcmd_failure_signal(self, text: str) -> str | None:
         """Detect the failure forms SteamCMD commonly emits."""
         if not text:
@@ -727,9 +741,12 @@ class Engine:
             last_activity = time.monotonic()
             content_log = self.steamcmd.parent / "logs" / "content_log.txt"
             try:
-                content_log_stamp = (content_log.stat().st_mtime_ns, content_log.stat().st_size)
+                content_log_stat = content_log.stat()
+                content_log_stamp = (content_log_stat.st_mtime_ns, content_log_stat.st_size)
+                content_log_offset = content_log_stat.st_size
             except OSError:
                 content_log_stamp = None
+                content_log_offset = 0
             network_signature = network_connection_signature()
             last_network_check = last_activity
             observed_b = max(
@@ -770,8 +787,9 @@ class Engine:
                                 f"disk write {human_speed(disk_speed_ema)}",
                             )
 
-                    # SteamCMD writes detailed transfer and validation updates
-                    # to content_log.txt even when its stdout is quiet.
+                    # SteamCMD writes detailed transfer, validation, depot, and
+                    # failure information to content_log.txt even when stdout is quiet.
+                    # Forward ONLY newly appended lines to the GUI Live Log.
                     try:
                         new_content_log_stamp = (
                             content_log.stat().st_mtime_ns,
@@ -781,15 +799,26 @@ class Engine:
                         new_content_log_stamp = None
                     if new_content_log_stamp != content_log_stamp:
                         content_log_stamp = new_content_log_stamp
-                        last_activity = now
-                        failure_signal = self._steamcmd_failure_signal(self._content_log_tail())
-                        if failure_signal:
-                            killed = True
-                            killed_reason = "SteamCMD content-log failure"
-                            self._kill(proc)
-                            self.emit("status", "SteamCMD reported a download failure — restarting; partial data is preserved")
-                            self._log(item.item_id, "CONTENT LOG FAILURE: " + failure_signal)
-                            break
+                        content_data, content_log_offset = self._content_log_new_data(content_log_offset)
+                        if content_data:
+                            last_activity = now
+                            for content_line in content_data.splitlines():
+                                content_line = content_line.strip()
+                                if not content_line:
+                                    continue
+                                live_line = "CONTENT: " + content_line
+                                self.emit("log", live_line)
+                                self._log(item.item_id, live_line)
+                            failure_signal = self._steamcmd_failure_signal(content_data)
+                            if failure_signal:
+                                killed = True
+                                killed_reason = "SteamCMD content-log failure"
+                                self._kill(proc)
+                                reason_line = "STATUS: SteamCMD reported a download failure — restarting; partial data is preserved"
+                                self.emit("status", reason_line.removeprefix("STATUS: "))
+                                self.emit("log", reason_line)
+                                self._log(item.item_id, "CONTENT LOG FAILURE: " + failure_signal)
+                                break
 
                     # If the active Wi-Fi connection changes while SteamCMD is
                     # running, restart SteamCMD instead of leaving the old
@@ -1462,9 +1491,13 @@ class App:
                 if kind == "log":
                     self.add_log(str(payload))
                 elif kind == "status":
-                    self.status_var.set(str(payload))
+                    message = str(payload)
+                    self.status_var.set(message)
+                    self.add_log("STATUS: " + message)
                 elif kind == "info":
-                    self.info_var.set(str(payload))
+                    message = str(payload)
+                    self.info_var.set(message)
+                    self.add_log("INFO: " + message)
                 elif kind == "progress":
                     p = payload
                     self.bar.configure(value=min(100.0, max(0.0, p["pct"] or 0)))
@@ -1475,17 +1508,34 @@ class App:
                         self.speed_var.set("System network: " + human_speed(p["speed"]))
                     else:
                         self.speed_var.set("System network: unavailable")
-                    self.disk_speed_var.set("Disk write: " + human_speed(p.get("disk_speed", 0.0)))
+                    disk_speed = p.get("disk_speed", 0.0)
+                    self.disk_speed_var.set("Disk write: " + human_speed(disk_speed))
                     self.eta_var.set("ETA " + eta_text(p["eta"]))
                     self.attempt_var.set(f"Attempt {p['attempt']}")
+                    elapsed = max(0.0, float(p.get("elapsed", 0.0)))
+                    elapsed_text = eta_text(elapsed)
+                    total_text = human_bytes(p["total"]) if p["total"] else "unknown"
+                    self.add_log(
+                        f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                        f" ({p['pct']:.2f}%)" if p["pct"] is not None else
+                        f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                        f" | network {human_speed(p['speed'])}"
+                        f" | disk {human_speed(disk_speed)}"
+                        f" | ETA {eta_text(p['eta'])}"
+                        f" | attempt {p['attempt']} | elapsed {elapsed_text}"
+                    )
                 elif kind == "export_progress":
                     b, t, name = payload
                     self.bar.configure(value=(b / t * 100.0) if t else 0)
                     self.progress_var.set(f"Export {human_bytes(b)} / {human_bytes(t)}")
-                    self.status_var.set(f"Exporting {name}")
+                    export_message = f"Exporting {name}: {human_bytes(b)} / {human_bytes(t)}"
+                    self.status_var.set(export_message)
+                    self.add_log("EXPORT: " + export_message)
                 elif kind == "finished":
                     ok, msg = payload
-                    self.status_var.set(("DONE: " if ok else "FAILED: ") + str(msg))
+                    result_text = ("DONE: " if ok else "FAILED: ") + str(msg)
+                    self.status_var.set(result_text)
+                    self.add_log("RESULT: " + result_text)
                 elif kind == "update_ready":
                     self.status_var.set("Update downloaded. Restarting…")
                     self.update_btn.configure(state="disabled")
