@@ -476,7 +476,7 @@ class Engine:
     def _progress(self, item: ItemInfo, attempt: int, started: float,
                   prev_b: int, prev_t: float, last_net_b: int | None,
                   last_net_t: float, net_samples: list[tuple[float, int]],
-                  network_speed_ema: float):
+                  network_speed_ema: float, disk_speed_ema: float):
         partial = self.partial_root / item.item_id
         installed = self.installed_root / item.item_id
         current = max(sum_tree_bytes(partial), sum_tree_bytes(installed))
@@ -486,7 +486,14 @@ class Engine:
 
         # SteamCMD writes data in bursts, so filesystem growth is useful as a
         # diagnostic but is NOT the network download rate.
-        disk_speed = db / dt if db > 0 else 0.0
+        disk_raw_speed = db / dt if db > 0 else 0.0
+        # SteamCMD writes in bursts. Smooth filesystem-growth telemetry so the
+        # UI does not oscillate between a real rate and 0 B/s.
+        disk_speed = (
+            disk_raw_speed if disk_speed_ema <= 0
+            else (disk_speed_ema * 0.75) + (disk_raw_speed * 0.25)
+        )
+        disk_speed_ema = disk_speed
 
         # PowerShell is only a fallback for machines without psutil and is
         # relatively expensive to launch. Sample the system counter every 3s.
@@ -534,6 +541,7 @@ class Engine:
             "pct": pct,
             "speed": network_speed,
             "disk_speed": disk_speed,
+            "disk_speed_ema": disk_speed_ema,
             "eta": eta,
             "attempt": attempt,
             "elapsed": now - started,
@@ -653,6 +661,7 @@ class Engine:
         last_net_t = prev_t
         net_samples: list[tuple[float, int]] = []
         network_speed_ema = 0.0
+        disk_speed_ema = 0.0
         network_signature = network_connection_signature()
         last_network_check = prev_t
         last_activity = prev_t
@@ -745,9 +754,9 @@ class Engine:
                 now = time.monotonic()
                 if now - last_scan >= self.poll:
                     previous_b = observed_b
-                    prev_b, prev_t, last_net_b, last_net_t, network_speed_ema = self._progress(
+                    prev_b, prev_t, last_net_b, last_net_t, network_speed_ema, disk_speed_ema = self._progress(
                         item, attempt, start, prev_b, prev_t,
-                        last_net_b, last_net_t, net_samples, network_speed_ema,
+                        last_net_b, last_net_t, net_samples, network_speed_ema, disk_speed_ema,
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
@@ -939,8 +948,8 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("BO3 Workshop Downloader")
-        self.root.geometry("1020x760")
-        self.root.minsize(900, 650)
+        self.root.geometry("1120x800")
+        self.root.minsize(980, 700)
         self.events: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
         self.engine: Engine | None = None
@@ -968,7 +977,7 @@ class App:
         self.status_var = StringVar(value="Ready")
         self.progress_var = StringVar(value="0 B / unknown")
         self.speed_var = StringVar(value="System network: 0 B/s")
-        self.disk_speed_var = StringVar(value="Disk: 0 B/s")
+        self.disk_speed_var = StringVar(value="Disk write: 0 B/s")
         self.eta_var = StringVar(value="ETA --:--")
         self.attempt_var = StringVar(value="Attempt 0")
         self.info_var = StringVar(value="")
@@ -979,10 +988,16 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def build_ui(self):
-        main = ttk.Frame(self.root, padding=12)
+        main = ttk.Frame(self.root, padding=16)
         main.pack(fill=BOTH, expand=True)
 
-        config = ttk.LabelFrame(main, text="SteamCMD", padding=8)
+        header = ttk.Frame(main)
+        header.pack(fill=X, pady=(0, 10))
+        ttk.Label(header, text="BO3 WORKSHOP DOWNLOADER", style="Title.TLabel").pack(side=LEFT)
+        ttk.Label(header, text="SteamCMD • resilient Workshop downloads", style="Subtitle.TLabel").pack(side=LEFT, padx=(14, 0))
+        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side=RIGHT)
+
+        config = ttk.LabelFrame(main, text="  STEAMCMD  ", padding=10)
         config.pack(fill=X)
         ttk.Label(config, text="steamcmd.exe").grid(row=0, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(config, textvariable=self.steamcmd_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
@@ -992,29 +1007,31 @@ class App:
         ttk.Label(config, text="Output folder").grid(row=2, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(config, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(config, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=6)
-        self.update_btn = ttk.Button(config, text="UPDATE", command=self.update_app)
+        self.update_btn = ttk.Button(config, text="CHECK FOR UPDATE", command=self.update_app)
         self.update_btn.grid(row=0, column=3, rowspan=3, padx=(14, 6), sticky="ns")
         ttk.Checkbutton(
             config, text="Dark mode", variable=self.dark_mode_var, command=self.apply_theme,
         ).grid(row=3, column=1, sticky="w", padx=6, pady=(3, 5))
         config.columnconfigure(1, weight=1)
 
-        workshop = ttk.LabelFrame(main, text="Workshop queue", padding=8)
+        workshop = ttk.LabelFrame(main, text="  WORKSHOP QUEUE  ", padding=10)
         workshop.pack(fill=X, pady=(10, 0))
         ttk.Label(workshop, text="IDs / Workshop URLs").grid(row=0, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(workshop, textvariable=self.ids_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
         self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
         self.start_btn.grid(row=1, column=1, sticky="w", padx=6, pady=5)
-        self.clear_btn = ttk.Button(workshop, text="FRESH DOWNLOAD", command=self.clear_old_data)
+        self.clear_btn = ttk.Button(workshop, text="CLEAR & FRESH", command=self.clear_old_data)
         self.clear_btn.grid(row=1, column=2, padx=6, pady=5)
         self.stop_btn = ttk.Button(workshop, text="STOP", command=self.stop, state="disabled")
         self.stop_btn.grid(row=1, column=1, sticky="e", padx=6, pady=5)
         ttk.Label(workshop, textvariable=self.info_var).grid(row=2, column=1, sticky="w", padx=6, pady=5)
         workshop.columnconfigure(1, weight=1)
 
-        opts = ttk.Frame(main)
-        opts.pack(fill=X, pady=(8, 0))
+        opts_frame = ttk.LabelFrame(main, text="  DOWNLOAD OPTIONS  ", padding=10)
+        opts_frame.pack(fill=X, pady=(10, 0))
+        opts = ttk.Frame(opts_frame)
+        opts.pack(fill=X)
         ttk.Label(opts, text="Max retries (0 = infinite)").pack(side=LEFT, padx=5)
         ttk.Entry(opts, textvariable=self.retry_var, width=7).pack(side=LEFT)
         ttk.Label(opts, text="Watchdog (sec)").pack(side=LEFT, padx=(18, 5))
@@ -1024,21 +1041,21 @@ class App:
         ttk.Checkbutton(opts, text="Export completed item", variable=self.auto_export_var).pack(side=LEFT, padx=18)
         ttk.Checkbutton(opts, text="Use Steam client's download region", variable=self.inherit_region_var).pack(side=LEFT, padx=18)
 
-        progress = ttk.LabelFrame(main, text="Real progress", padding=10)
+        progress = ttk.LabelFrame(main, text="  DOWNLOAD STATUS  ", padding=12)
         progress.pack(fill=X, pady=(10, 0))
         self.bar = ttk.Progressbar(progress, maximum=100, mode="determinate")
         self.bar.pack(fill=X, pady=(0, 8))
         row = ttk.Frame(progress)
         row.pack(fill=X)
-        ttk.Label(row, textvariable=self.progress_var, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
-        ttk.Label(row, textvariable=self.speed_var).pack(side=LEFT, padx=25)
-        ttk.Label(row, textvariable=self.disk_speed_var).pack(side=LEFT, padx=25)
-        ttk.Label(row, textvariable=self.eta_var).pack(side=LEFT, padx=25)
-        ttk.Label(row, textvariable=self.attempt_var).pack(side=RIGHT)
+        ttk.Label(row, textvariable=self.progress_var, style="Metric.TLabel").pack(side=LEFT)
+        ttk.Label(row, textvariable=self.speed_var, style="MetricSecondary.TLabel").pack(side=LEFT, padx=24)
+        ttk.Label(row, textvariable=self.disk_speed_var, style="MetricSecondary.TLabel").pack(side=LEFT, padx=24)
+        ttk.Label(row, textvariable=self.eta_var, style="MetricSecondary.TLabel").pack(side=LEFT, padx=24)
+        ttk.Label(row, textvariable=self.attempt_var, style="MetricSecondary.TLabel").pack(side=RIGHT)
 
-        ttk.Label(main, textvariable=self.status_var).pack(fill=X, pady=(8, 4))
+        ttk.Label(main, text="Live activity", style="Section.TLabel").pack(fill=X, pady=(10, 4))
 
-        logs = ttk.LabelFrame(main, text="SteamCMD output", padding=5)
+        logs = ttk.LabelFrame(main, text="  LIVE LOG  ", padding=6)
         logs.pack(fill=BOTH, expand=True)
         self.log_box = ttk.Treeview(logs, columns=("line",), show="headings", selectmode="extended")
         self.log_box.heading("line", text="Output")
@@ -1180,6 +1197,12 @@ class App:
 
     def apply_theme(self):
         style = ttk.Style(self.root)
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Metric.TLabel", font=("Segoe UI", 12, "bold"))
+        style.configure("MetricSecondary.TLabel", font=("Segoe UI", 9))
         if not self.dark_mode_var.get():
             style.theme_use(self.light_theme)
             self.root.configure(background="SystemButtonFace")
@@ -1193,6 +1216,12 @@ class App:
         accent = "#5865f2"
         self.root.configure(background=background)
         style.configure(".", background=background, foreground=foreground)
+        style.configure("Title.TLabel", background=background, foreground=foreground)
+        style.configure("Subtitle.TLabel", background=background, foreground="#aeb4c0")
+        style.configure("Status.TLabel", background=background, foreground="#7dd3fc")
+        style.configure("Section.TLabel", background=background, foreground=foreground)
+        style.configure("Metric.TLabel", background=background, foreground=foreground)
+        style.configure("MetricSecondary.TLabel", background=background, foreground="#b9c0cc")
         style.configure("TFrame", background=background)
         style.configure("TLabel", background=background, foreground=foreground)
         style.configure("TLabelframe", background=background, foreground=foreground)
@@ -1438,7 +1467,7 @@ class App:
                         self.speed_var.set("System network: " + human_speed(p["speed"]))
                     else:
                         self.speed_var.set("System network: unavailable")
-                    self.disk_speed_var.set("Disk: " + human_speed(p.get("disk_speed", 0.0)))
+                    self.disk_speed_var.set("Disk write: " + human_speed(p.get("disk_speed", 0.0)))
                     self.eta_var.set("ETA " + eta_text(p["eta"]))
                     self.attempt_var.set(f"Attempt {p['attempt']}")
                 elif kind == "export_progress":
