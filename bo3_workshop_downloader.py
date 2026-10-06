@@ -1444,13 +1444,16 @@ class App:
         script = Path(__file__).resolve()
         temp = Path(temp_path)
         helper = script.with_name(".bo3wd_apply_update.cmd")
-        py = str(Path(sys.executable).resolve())
+        launcher = script.with_name("launch_hidden.vbs")
+        launcher_log = script.with_name("launcher.log")
         bat = (
             "@echo off\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
-            f'move /Y "{temp}" "{script}" >nul\r\n'
-            f'start "" "{py}" "{script}"\r\n'
-            'del "%~f0"\r\n'
+            f'move /Y "{temp}" "{script}" >nul 2>&1\r\n'
+            f'if not exist "{script}" echo %date% %time% - Update move failed > "{launcher_log}"\r\n'
+            f'if exist "{launcher}" start "" wscript.exe "{launcher}"\r\n'
+            f'if not exist "{launcher}" start "" /b cmd.exe /c "pyw.exe \"{script}\""\r\n'
+            'del "%~f0" >nul 2>&1\r\n'
         )
         try:
             helper.write_text(bat, encoding="utf-8")
