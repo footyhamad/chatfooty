@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "d260e4f226b88c18d9ba1ab242780ad6006e9da4"
+BUILD_REVISION = "65d2efbaaf55456feee70442f28d04281cce0d7f"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -754,7 +754,7 @@ class Engine:
         invalid: list[tuple[Path, bytes]] = []
         if not root.is_dir():
             return invalid
-        expected = b"TAff\x00\x00"
+        expected = b"TAff0000"
         try:
             for base, _dirs, files in os.walk(root):
                 for name in files:
@@ -790,7 +790,7 @@ class Engine:
                     self.emit(
                         "log",
                         f"Integrity repair: removed invalid fastfile {path} "
-                        f"(header {header.hex() or 'unreadable'}; expected 544166660000).",
+                        f"(header {header.hex() or 'unreadable'}; expected 5441666630303030).",
                     )
             except OSError as exc:
                 raise RuntimeError(f"Could not remove invalid fastfile {path}: {exc}") from exc
