@@ -333,6 +333,7 @@ class ItemInfo:
     title: str = ""
     size: int = 0
     app: str = ""
+    size_source: str = "unknown"
 
 
 class WorkshopAPI:
@@ -381,10 +382,15 @@ class WorkshopAPI:
         entry = data["response"]["publishedfiledetails"][0]
         if str(entry.get("result", "1")) != "1":
             raise RuntimeError(f"Steam returned result {entry.get('result')}")
-        size = int(entry.get("file_size", 0) or 0)
+        api_size = int(entry.get("file_size", 0) or 0)
+        size = api_size
+        size_source = "Steam API" if api_size else "unknown"
         if not size:
             try:
-                size = WorkshopAPI._page_size(item_id)
+                page_size = WorkshopAPI._page_size(item_id)
+                if page_size:
+                    size = page_size
+                    size_source = "Workshop webpage (theoretical)"
             except Exception:
                 pass
 
@@ -393,6 +399,7 @@ class WorkshopAPI:
             title=entry.get("title", "") or "",
             size=size,
             app=str(entry.get("consumer_app_id", "") or ""),
+            size_source=size_source,
         )
 
 
@@ -761,18 +768,23 @@ class Engine:
         if file_count == 0:
             return False, "SteamCMD reported success, but no installed Workshop files were found."
 
-        if item.size:
+        if item.size and item.size_source != "Workshop webpage (theoretical)":
             ratio = size / item.size
             if ratio < 0.95 or ratio > 1.05:
-                # Do not silently reject unusual Workshop metadata. The SteamCMD
-                # success marker remains authoritative, but surface a clear warning.
                 self.emit(
                     "log",
                     f"Integrity warning: installed size {human_bytes(size)} differs "
                     f"from Steam's reported {human_bytes(item.size)} ({ratio * 100:.1f}%)."
                 )
 
-        return True, f"Verified {file_count:,} file(s), {human_bytes(size)} on disk"
+        source_note = (
+            " (size reference: Workshop webpage, theoretical)"
+            if item.size_source == "Workshop webpage (theoretical)"
+            else f" (size reference: {item.size_source})"
+            if item.size_source != "unknown"
+            else ""
+        )
+        return True, f"Verified {file_count:,} file(s), {human_bytes(size)} on disk{source_note}"
 
     def export(self, item: ItemInfo) -> Path:
         src = self.installed_root / item.item_id
@@ -1561,7 +1573,7 @@ class App:
             for iid in ids:
                 try:
                     info = WorkshopAPI.get(iid)
-                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}" + (" [theoretical]" if info.size_source == "Workshop webpage (theoretical)" else "")))
                 except Exception as exc:
                     self.events.put(("log", f"Lookup {iid} failed: {exc}"))
         threading.Thread(target=work, daemon=True).start()
@@ -1624,14 +1636,18 @@ class App:
                     break
                 try:
                     info = WorkshopAPI.get(iid)
-                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}"))
+                    self.events.put(("info", f"{iid}: {info.title or 'unknown'} — {human_bytes(info.size) if info.size else 'size unknown'}" + (" [theoretical]" if info.size_source == "Workshop webpage (theoretical)" else "")))
                 except Exception as exc:
                     self.events.put(("log", f"Metadata lookup failed for {iid}: {exc}"))
                     info = ItemInfo(iid)
                 if info.app and info.app != APP_ID:
                     self.events.put(("finished", (False, f"{iid} belongs to app {info.app}, not BO3 ({APP_ID})")))
                     continue
-                self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'}"))
+                size_label = human_bytes(info.size) if info.size else "size unknown"
+                if info.size_source == "Workshop webpage (theoretical)":
+                    size_label += " [theoretical]"
+                    self.events.put(("log", "Size reference is theoretical: Steam API/SteamCMD size was unavailable, so the Workshop webpage size is display-only."))
+                self.events.put(("status", f"Downloading {iid}: {info.title or 'unknown'} — {size_label}"))
                 is_fresh = iid in self.fresh_ids
                 self.engine.download(info, require_empty_start=is_fresh)
                 # After the first launch, a failed download is resumable by design.
