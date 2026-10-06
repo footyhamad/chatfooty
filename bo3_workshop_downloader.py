@@ -35,6 +35,8 @@ DEFAULTS = {
     "auto_export": True,
     "inherit_steam_region": True,
     "retry_backoff_seconds": 5,
+    "last_started_ids": "3296316642",
+    "dark_mode": False,
 }
 ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 SUCCESS_RE = re.compile(r"Success\. Downloaded item (\d+)", re.I)
@@ -166,11 +168,11 @@ def network_connection_signature() -> str | None:
                 check=False,
             )
             text = result.stdout or ""
-            state = re.search(r"^\\s*State\\s*:\\s*(.+)$", text, re.I | re.M)
+            state = re.search(r"^\s*State\s*:\s*(.+)$", text, re.I | re.M)
             if state and state.group(1).strip().lower() == "connected":
-                ssid = re.search(r"^\\s*SSID\\s*:\\s*(.+)$", text, re.I | re.M)
-                bssid = re.search(r"^\\s*BSSID\\s*:\\s*(.+)$", text, re.I | re.M)
-                channel = re.search(r"^\\s*Channel\\s*:\\s*(.+)$", text, re.I | re.M)
+                ssid = re.search(r"^\s*SSID\s*:\s*(.+)$", text, re.I | re.M)
+                bssid = re.search(r"^\s*BSSID\s*:\s*(.+)$", text, re.I | re.M)
+                channel = re.search(r"^\s*Channel\s*:\s*(.+)$", text, re.I | re.M)
                 return "wifi|" + "|".join([
                     ssid.group(1).strip() if ssid else "",
                     bssid.group(1).strip().lower() if bssid else "",
@@ -476,13 +478,13 @@ class Engine:
                 network_speed = raw_network_speed
             else:
                 network_speed = (network_speed_ema * 0.75) + (raw_network_speed * 0.25)
+            network_speed_ema = network_speed
         else:
             network_speed = network_speed_ema if network_speed_ema > 0 else 0.0
 
-        # Use the network rate for ETA when available. It is system-wide, so
-        # other traffic can influence it; this is preferable to reporting
-        # SteamCMD's bursty disk writes as if they were Internet speed.
-        eta_speed = network_speed if network_speed > 0 else disk_speed
+        # System network traffic is only a diagnostic. Use actual Workshop
+        # file growth for the ETA so unrelated downloads cannot make it lie.
+        eta_speed = disk_speed
         pct = (current / item.size * 100.0) if item.size else None
         eta = ((item.size - current) / eta_speed) if item.size and eta_speed > 0 else None
         self.emit("progress", {
@@ -658,8 +660,14 @@ class Engine:
             threading.Thread(target=reader, daemon=True).start()
             last_scan = 0.0
             killed = False
+            killed_reason = ""
             stalled = False
             last_activity = time.monotonic()
+            content_log = self.steamcmd.parent / "logs" / "content_log.txt"
+            try:
+                content_log_stamp = (content_log.stat().st_mtime_ns, content_log.stat().st_size)
+            except OSError:
+                content_log_stamp = None
             network_signature = network_connection_signature()
             last_network_check = last_activity
             observed_b = max(
@@ -682,13 +690,6 @@ class Engine:
                     last_activity = time.monotonic()
 
                 now = time.monotonic()
-                if now - start >= self.watchdog:
-                    killed = True
-                    self._kill(proc)
-                    self.emit("status", f"Watchdog hit {self.watchdog}s — restarting; partial data is preserved")
-                    self._log(item.item_id, f"WATCHDOG KILL after {self.watchdog}s")
-                    break
-
                 if now - last_scan >= self.poll:
                     previous_b = observed_b
                     prev_b, prev_t, last_net_b, last_net_t, network_speed_ema = self._progress(
@@ -697,6 +698,19 @@ class Engine:
                     )
                     if prev_b > previous_b:
                         observed_b = prev_b
+                        last_activity = now
+
+                    # SteamCMD writes detailed transfer and validation updates
+                    # to content_log.txt even when its stdout is quiet.
+                    try:
+                        new_content_log_stamp = (
+                            content_log.stat().st_mtime_ns,
+                            content_log.stat().st_size,
+                        )
+                    except OSError:
+                        new_content_log_stamp = None
+                    if new_content_log_stamp != content_log_stamp:
+                        content_log_stamp = new_content_log_stamp
                         last_activity = now
 
                     # If the active Wi-Fi connection changes while SteamCMD is
@@ -714,6 +728,7 @@ class Engine:
                                 "Network connection changed — restarting SteamCMD; partial data is preserved",
                             )
                             self._log(item.item_id, "NETWORK CHANGE DETECTED: restarting SteamCMD")
+                            killed_reason = "network change"
                             network_signature = new_signature
                             break
                         network_signature = new_signature
@@ -721,12 +736,24 @@ class Engine:
                     if now - last_activity >= self.stall_seconds:
                         stalled = True
                         killed = True
+                        killed_reason = "stall"
                         self._kill(proc)
                         self.emit(
                             "status",
                             f"No download activity for {self.stall_seconds}s — restarting; partial data is preserved",
                         )
-                        self._log(item.item_id, f"STALL DETECTED after {self.stall_seconds}s without output or file growth")
+                        self._log(item.item_id, f"STALL DETECTED after {self.stall_seconds}s without SteamCMD activity")
+                        break
+
+                    # This is deliberately inactivity-based, not a hard cap on
+                    # the total session duration. Slow, healthy downloads and
+                    # validation passes may run longer than the watchdog value.
+                    if now - last_activity >= self.watchdog:
+                        killed = True
+                        killed_reason = "watchdog"
+                        self._kill(proc)
+                        self.emit("status", f"No SteamCMD activity for {self.watchdog}s — restarting; partial data is preserved")
+                        self._log(item.item_id, f"WATCHDOG KILL after {self.watchdog}s without activity")
                         break
 
                     last_scan = now
@@ -801,8 +828,7 @@ class Engine:
                     sum_tree_bytes(self.installed_root / item.item_id),
                 )
                 reason = (
-                    "stall" if stalled else
-                    "watchdog" if killed and "WATCHDOG" in "\n".join(output) else
+                    killed_reason if killed_reason else
                     "SteamCMD failure"
                 )
                 delay = min(60, self.retry_backoff_seconds * (2 ** min(attempt - 1, 4)))
@@ -844,28 +870,32 @@ class App:
         self.fresh_ids: set[str] = set()
         self.cfg_path = Path(__file__).with_name("bo3wd.json")
         cfg = {**DEFAULTS, **read_json(self.cfg_path)}
+        self.light_theme = ttk.Style(self.root).theme_use()
+        self.last_started_ids = str(cfg["last_started_ids"])
 
         detected = find_steamcmd()
         self.steamcmd_var = StringVar(value=cfg["steamcmd"] or (str(detected) if detected else ""))
         user = cfg["steam_user"] or (detect_steam_user(Path(self.steamcmd_var.get())) if self.steamcmd_var.get() else "")
         self.user_var = StringVar(value=user)
         self.output_var = StringVar(value=cfg["output_dir"])
-        self.ids_var = StringVar(value="3296316642")
+        self.ids_var = StringVar(value=self.last_started_ids)
         self.retry_var = StringVar(value=str(cfg["max_retries"]))
         self.watchdog_var = StringVar(value=str(cfg["watchdog_seconds"]))
         self.stall_var = StringVar(value=str(cfg["stall_seconds"]))
         self.auto_export_var = BooleanVar(value=bool(cfg["auto_export"]))
         self.inherit_region_var = BooleanVar(value=bool(cfg["inherit_steam_region"]))
+        self.dark_mode_var = BooleanVar(value=bool(cfg["dark_mode"]))
 
         self.status_var = StringVar(value="Ready")
         self.progress_var = StringVar(value="0 B / unknown")
-        self.speed_var = StringVar(value="Network: 0 B/s")
+        self.speed_var = StringVar(value="System network: 0 B/s")
         self.disk_speed_var = StringVar(value="Disk: 0 B/s")
         self.eta_var = StringVar(value="ETA --:--")
         self.attempt_var = StringVar(value="Attempt 0")
         self.info_var = StringVar(value="")
 
         self.build_ui()
+        self.apply_theme()
         self.root.after(100, self.poll_events)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -885,6 +915,9 @@ class App:
         ttk.Button(config, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=6)
         self.update_btn = ttk.Button(config, text="UPDATE", command=self.update_app)
         self.update_btn.grid(row=0, column=3, rowspan=3, padx=(14, 6), sticky="ns")
+        ttk.Checkbutton(
+            config, text="Dark mode", variable=self.dark_mode_var, command=self.apply_theme,
+        ).grid(row=3, column=1, sticky="w", padx=6, pady=(3, 5))
         config.columnconfigure(1, weight=1)
 
         workshop = ttk.LabelFrame(main, text="Workshop queue", padding=8)
@@ -1066,6 +1099,34 @@ class App:
         if p:
             self.output_var.set(p)
 
+    def apply_theme(self):
+        style = ttk.Style(self.root)
+        if not self.dark_mode_var.get():
+            style.theme_use(self.light_theme)
+            self.root.configure(background="SystemButtonFace")
+            return
+
+        style.theme_use("clam")
+        background = "#1e1f22"
+        surface = "#2b2d31"
+        input_background = "#313338"
+        foreground = "#f2f3f5"
+        accent = "#5865f2"
+        self.root.configure(background=background)
+        style.configure(".", background=background, foreground=foreground)
+        style.configure("TFrame", background=background)
+        style.configure("TLabel", background=background, foreground=foreground)
+        style.configure("TLabelframe", background=background, foreground=foreground)
+        style.configure("TLabelframe.Label", background=background, foreground=foreground)
+        style.configure("TEntry", fieldbackground=input_background, foreground=foreground)
+        style.configure("TCheckbutton", background=background, foreground=foreground)
+        style.configure("TButton", background=surface, foreground=foreground, padding=(8, 4))
+        style.map("TButton", background=[("active", accent), ("pressed", "#4752c4")])
+        style.configure("Treeview", background=input_background, fieldbackground=input_background, foreground=foreground)
+        style.configure("Treeview.Heading", background=surface, foreground=foreground)
+        style.map("Treeview", background=[("selected", accent)], foreground=[("selected", foreground)])
+        style.configure("Horizontal.TProgressbar", troughcolor=input_background, background=accent)
+
     def ids(self) -> list[str]:
         return list(dict.fromkeys(x for x in re.split(r"[\s,;]+", self.ids_var.get()) if x.isdigit()))
 
@@ -1081,6 +1142,8 @@ class App:
             "poll_seconds": 2.0,
             "auto_export": bool(self.auto_export_var.get()),
             "inherit_steam_region": bool(self.inherit_region_var.get()),
+            "last_started_ids": self.last_started_ids,
+            "dark_mode": bool(self.dark_mode_var.get()),
         })
 
     def lookup(self):
@@ -1135,6 +1198,9 @@ class App:
             messagebox.showerror("Settings", "Retries, watchdog, and stall timeout must be valid integers (stall >= 30).")
             return
 
+        # Persist only IDs that have actually been started, rather than saving
+        # transient edits that were never submitted to SteamCMD.
+        self.last_started_ids = " ".join(ids)
         self.save()
         self.log_box.delete(*self.log_box.get_children())
         self.bar.configure(value=0)
@@ -1212,7 +1278,7 @@ class App:
             self.fresh_ids.update(ids)
             self.bar.configure(value=0)
             self.progress_var.set("0 B / unknown")
-            self.speed_var.set("Network: 0 B/s")
+            self.speed_var.set("System network: 0 B/s")
             self.disk_speed_var.set("Disk: 0 B/s")
             self.eta_var.set("ETA --:--")
             self.status_var.set(
@@ -1286,9 +1352,9 @@ class App:
                     pct = f" ({p['pct']:.2f}%)" if p["pct"] is not None else ""
                     self.progress_var.set(f"{human_bytes(p['bytes'])} / {total}{pct}")
                     if p.get("network_available"):
-                        self.speed_var.set("Network: " + human_speed(p["speed"]))
+                        self.speed_var.set("System network: " + human_speed(p["speed"]))
                     else:
-                        self.speed_var.set("Network: unavailable")
+                        self.speed_var.set("System network: unavailable")
                     self.disk_speed_var.set("Disk: " + human_speed(p.get("disk_speed", 0.0)))
                     self.eta_var.set("ETA " + eta_text(p["eta"]))
                     self.attempt_var.set(f"Attempt {p['attempt']}")

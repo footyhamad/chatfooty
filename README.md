@@ -14,11 +14,13 @@ The GUI reports progress independently by summing the actual files under SteamCM
 - SteamCMD only; no custom Steam CDN implementation
 - Automatic retry/resume after timeout or failure
 - Never clears partial Workshop download data on retry
-- Real progress, speed, and ETA from the filesystem
+- Real progress and a filesystem-based ETA, separate from system network diagnostics
 - Workshop metadata lookup (title and expected size)
 - Multiple Workshop IDs in one queue
 - Optional export/copy to a custom output directory
 - Persistent settings
+- Last started Workshop IDs restored on the next launch
+- Optional dark mode using standard Tkinter widgets
 - Per-item SteamCMD logs
 - Windows GUI using stdlib Tkinter
 

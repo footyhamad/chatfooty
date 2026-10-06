@@ -3,7 +3,11 @@
   "steam_user": "",
   "output_dir": "BO3-Workshop",
   "max_retries": 0,
-  "hung_timeout_seconds": 420,
+  "watchdog_seconds": 420,
+  "stall_seconds": 75,
   "poll_seconds": 2.0,
-  "auto_export": true
+  "auto_export": true,
+  "inherit_steam_region": true,
+  "last_started_ids": "3296316642",
+  "dark_mode": false
 }
