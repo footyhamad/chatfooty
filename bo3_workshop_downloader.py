@@ -703,9 +703,17 @@ class Engine:
                 return None
 
             partial = self.partial_root / item.item_id
-            self.emit("status", f"Attempt {attempt}: " +
-                      ("resuming existing partial data" if partial.exists() else "starting"))
-            self._log(item.item_id, f"\\n=== attempt {attempt} ===")
+            mode = "RESUME" if partial.exists() else "START"
+            status_message = f"Attempt {attempt}: " + ("resuming existing partial data" if partial.exists() else "starting")
+            self.emit("status", status_message)
+            self.emit("log", f"=== ATTEMPT {attempt} [{mode}] ===")
+            self.emit("log", f"WORKSHOP ID: {item.item_id}")
+            self.emit("log", f"TITLE: {item.title or 'unknown'}")
+            self.emit("log", f"EXPECTED SIZE: {human_bytes(item.size) if item.size else 'unknown'}")
+            self.emit("log", f"PARTIAL PATH: {partial}")
+            self.emit("log", f"INSTALLED PATH: {self.installed_root / item.item_id}")
+            self.emit("log", "$ steamcmd +login *** +workshop_download_item 311210 " + item.item_id + " validate +quit")
+            self._log(item.item_id, f"\\n=== attempt {attempt} [{mode}] ===")
             self._log(item.item_id, "$ steamcmd +login *** +workshop_download_item 311210 " + item.item_id + " validate +quit")
 
             proc = subprocess.Popen(
@@ -1515,15 +1523,20 @@ class App:
                     elapsed = max(0.0, float(p.get("elapsed", 0.0)))
                     elapsed_text = eta_text(elapsed)
                     total_text = human_bytes(p["total"]) if p["total"] else "unknown"
-                    self.add_log(
+                    progress_message = (
                         f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
-                        f" ({p['pct']:.2f}%)" if p["pct"] is not None else
-                        f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                        f" ({p['pct']:.2f}%)"
+                        if p["pct"] is not None
+                        else f"PROGRESS: {human_bytes(p['bytes'])} / {total_text}"
+                    )
+                    progress_message += (
                         f" | network {human_speed(p['speed'])}"
                         f" | disk {human_speed(disk_speed)}"
                         f" | ETA {eta_text(p['eta'])}"
-                        f" | attempt {p['attempt']} | elapsed {elapsed_text}"
+                        f" | attempt {p['attempt']}"
+                        f" | elapsed {elapsed_text}"
                     )
+                    self.add_log(progress_message)
                 elif kind == "export_progress":
                     b, t, name = payload
                     self.bar.configure(value=(b / t * 100.0) if t else 0)
