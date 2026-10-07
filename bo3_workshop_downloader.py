@@ -758,31 +758,31 @@ class Engine:
         formats get a magic-header check, and large uniform-byte files are
         treated as corruption (for example a preallocated all-zero XPAK).
         """
-        known_signatures: dict[str, tuple[tuple[int, bytes], ...]] = {
-            ".xpak": ((0, b"KAPI"),),
-            ".ff": ((0, b"TAff0000"),),
-            ".png": ((0, b"\x89PNG\r\n\x1a\n"),),
-            ".jpg": ((0, b"\xff\xd8\xff"),),
-            ".jpeg": ((0, b"\xff\xd8\xff"),),
-            ".gif": ((0, b"GIF87a"), (0, b"GIF89a")),
-            ".bmp": ((0, b"BM"),),
-            ".tif": ((0, b"II*\x00"), (0, b"MM\x00*")),
-            ".tiff": ((0, b"II*\x00"), (0, b"MM\x00*")),
-            ".webp": ((0, b"RIFF"), (8, b"WEBP")),
-            ".flac": ((0, b"fLaC"),),
-            ".ogg": ((0, b"OggS"),),
-            ".wav": ((0, b"RIFF"), (8, b"WAVE")),
-            ".zip": ((0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")),
-            ".7z": ((0, b"7z\xbc\xaf\x27\x1c"),),
-            ".rar": ((0, b"Rar!"),),
-            ".gz": ((0, b"\x1f\x8b"),),
-            ".bz2": ((0, b"BZh"),),
-            ".xz": ((0, b"\xfd7zXZ\x00"),),
-            ".exe": ((0, b"MZ"),),
-            ".dll": ((0, b"MZ"),),
-            ".sys": ((0, b"MZ"),),
-            ".elf": ((0, b"\x7fELF"),),
-            ".sprx": ((0, b"\x7fELF"),),
+        known_signatures: dict[str, tuple[str, tuple[tuple[int, bytes], ...]]] = {
+            ".xpak": ("all", ((0, b"KAPI"),)),
+            ".ff": ("all", ((0, b"TAff0000"),)),
+            ".png": ("all", ((0, b"\x89PNG\r\n\x1a\n"),)),
+            ".jpg": ("all", ((0, b"\xff\xd8\xff"),)),
+            ".jpeg": ("all", ((0, b"\xff\xd8\xff"),)),
+            ".gif": ("any", ((0, b"GIF87a"), (0, b"GIF89a"))),
+            ".bmp": ("all", ((0, b"BM"),)),
+            ".tif": ("any", ((0, b"II*\x00"), (0, b"MM\x00*"))),
+            ".tiff": ("any", ((0, b"II*\x00"), (0, b"MM\x00*"))),
+            ".webp": ("all", ((0, b"RIFF"), (8, b"WEBP"))),
+            ".flac": ("all", ((0, b"fLaC"),)),
+            ".ogg": ("all", ((0, b"OggS"),)),
+            ".wav": ("all", ((0, b"RIFF"), (8, b"WAVE"))),
+            ".zip": ("any", ((0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08"))),
+            ".7z": ("all", ((0, b"7z\xbc\xaf\x27\x1c"),)),
+            ".rar": ("all", ((0, b"Rar!"),)),
+            ".gz": ("all", ((0, b"\x1f\x8b"),)),
+            ".bz2": ("all", ((0, b"BZh"),)),
+            ".xz": ("all", ((0, b"\xfd7zXZ\x00"),)),
+            ".exe": ("all", ((0, b"MZ"),)),
+            ".dll": ("all", ((0, b"MZ"),)),
+            ".sys": ("all", ((0, b"MZ"),)),
+            ".elf": ("all", ((0, b"\x7fELF"),)),
+            ".sprx": ("all", ((0, b"\x7fELF"),)),
         }
 
         try:
@@ -802,13 +802,29 @@ class Engine:
             return False, f"read failed: {exc}"
 
         if checks:
-            for offset, expected in checks:
+            mode, signatures = checks
+            def matches(signature: tuple[int, bytes]) -> bool:
+                offset, expected = signature
                 end = offset + len(expected)
-                if len(header) < end or header[offset:end] != expected:
-                    return False, (
-                        f"invalid {ext} header: got={header[:32].hex()} "
-                        f"expected={expected.hex()} at offset {offset}"
+                return len(header) >= end and header[offset:end] == expected
+
+            valid = any(matches(signature) for signature in signatures) if mode == "any" else all(
+                matches(signature) for signature in signatures
+            )
+            if not valid:
+                expected_text = (
+                    " or ".join(
+                        f"{expected.hex()}@{offset}" for offset, expected in signatures
                     )
+                    if mode == "any"
+                    else ", ".join(
+                        f"{expected.hex()}@{offset}" for offset, expected in signatures
+                    )
+                )
+                return False, (
+                    f"invalid {ext} header: got={header[:32].hex()} "
+                    f"expected={expected_text}"
+                )
 
         digest = hashlib.sha256()
         first_byte: int | None = None
