@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "2026-10-07-per-file-integrity-scan-version-check"
+VERSION = "1.5.0"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -1422,7 +1422,7 @@ class Engine:
 class App:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("BO3 Workshop Downloader")
+        self.root.title(f"BO3 Workshop Downloader v{VERSION}")
         self.root.geometry("1120x800")
         self.root.minsize(980, 700)
         self.events: queue.Queue = queue.Queue()
@@ -1557,9 +1557,9 @@ class App:
 
     def check_version(self):
         """Show the installed downloader version without changing anything."""
-        version = BUILD_REVISION
-        self.status_var.set(f"Version: {version}")
-        self.add_log(f"VERSION CHECK: installed downloader revision = {version}")
+        version = VERSION
+        self.status_var.set(f"Version: v{version}")
+        self.add_log(f"VERSION CHECK: installed version = v{version}")
 
     def update_app(self):
         """Download the latest source from GitHub and replace this file.
@@ -1589,34 +1589,36 @@ class App:
                     raise RuntimeError("GitHub returned unexpected data; update aborted")
 
                 remote_text = remote_bytes.decode("utf-8", "replace")
-                remote_revision_match = re.search(
-                    r'^BUILD_REVISION = "([^"]+)"$',
+                remote_version_match = re.search(
+                    r'^VERSION = "([^"]+)"$',
                     remote_text,
                     re.M,
                 )
-                remote_revision = (
-                    remote_revision_match.group(1)
-                    if remote_revision_match
+                remote_version = (
+                    remote_version_match.group(1)
+                    if remote_version_match
                     else remote_sha
                 )
-                local_revision = globals().get("BUILD_REVISION", "")
+                local_version = VERSION
                 self.events.put((
                     "log",
-                    f"UPDATE CHECK: revision local={local_revision or 'unknown'} remote={remote_revision} "
+                    f"UPDATE CHECK: version local=v{local_version} remote=v{remote_version} "
                     f"| blob local={current_sha[:12]} remote={remote_sha[:12]}",
                 ))
 
-                # A revision match alone is not enough: source can change
-                # without a revision bump. Require the Git blob hash to match too.
-                if local_revision and remote_revision == local_revision and remote_sha == current_sha:
+                # Semantic version identifies the release; the blob hash also
+                # prevents a same-version source change from being ignored.
+                if remote_version == local_version and remote_sha == current_sha:
                     self.events.put((
                         "update_result",
-                        (True, f"Already up to date ({local_revision[:8]})."),
+                        (True, f"Already up to date (v{local_version})."),
                     ))
                     return
-                if not local_revision and remote_sha == current_sha:
-                    self.events.put(("update_result", (True, "Already up to date.")))
-                    return
+                if remote_version == local_version and remote_sha != current_sha:
+                    self.events.put((
+                        "log",
+                        "UPDATE CHECK: same version but source differs; update is available.",
+                    ))
 
                 temp = script.with_suffix(script.suffix + ".update")
                 temp.write_bytes(remote_bytes)
@@ -1779,7 +1781,7 @@ class App:
             "max_throughput": bool(self.max_throughput_var.get()),
             "last_started_ids": self.last_started_ids,
             "dark_mode": bool(self.dark_mode_var.get()),
-            "build_revision": BUILD_REVISION,
+            "version": VERSION,
         })
 
     def lookup(self):
