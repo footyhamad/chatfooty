@@ -29,6 +29,26 @@ The GUI reports progress independently by summing the actual files under SteamCM
 - Per-item SteamCMD logs
 - Windows GUI using stdlib Tkinter
 
+## Versioning
+
+Current release: **v1.5.0**
+
+The downloader follows Semantic Versioning (MAJOR.MINOR.PATCH):
+
+- MAJOR — breaking behavior or incompatible changes
+- MINOR — new backward-compatible features
+- PATCH — bug fixes, corrections, and small improvements
+
+Git commits use a consistent Conventional Commit-style prefix:
+
+- feat: for new features
+- fix: for bug fixes
+- refactor: for internal changes
+- docs: for documentation
+- chore: for maintenance
+- release(vX.Y.Z): for a release/version bump
+
+The GUI's CHECK VERSION option is read-only. It reports the installed semantic version and never performs an update. CHECK FOR UPDATE is the only action that can replace the downloader source.
 ## Run
 
 1. Install Python 3.10+ with Tkinter.
