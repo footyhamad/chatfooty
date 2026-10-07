@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "2026-10-07-ffmagic-fix"
+BUILD_REVISION = "2026-10-07-per-file-integrity"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -749,90 +749,208 @@ class Engine:
         })
         return current, now, last_net_b, last_net_t, network_speed_ema, disk_speed_ema
 
-    def _invalid_bo3_fastfiles(self, root: Path) -> list[tuple[Path, bytes]]:
-        """Return .ff files whose BO3 T7 fastfile header is invalid."""
-        invalid: list[tuple[Path, bytes]] = []
+    def _verify_file_bytes(self, path: Path) -> tuple[bool, str]:
+        """Read every byte once and reject obviously corrupted/invalid files.
+
+        SteamCMD's validate result is useful, but it can still leave a bad file
+        on disk in edge cases. This second layer is deliberately local and
+        deterministic: every file is opened and read fully, known container
+        formats get a magic-header check, and large uniform-byte files are
+        treated as corruption (for example a preallocated all-zero XPAK).
+        """
+        known_signatures: dict[str, tuple[tuple[int, bytes], ...]] = {
+            ".xpak": ((0, b"KAPI"),),
+            ".ff": ((0, b"TAff0000"),),
+            ".png": ((0, b"\x89PNG\r\n\x1a\n"),),
+            ".jpg": ((0, b"\xff\xd8\xff"),),
+            ".jpeg": ((0, b"\xff\xd8\xff"),),
+            ".gif": ((0, b"GIF87a"), (0, b"GIF89a")),
+            ".bmp": ((0, b"BM"),),
+            ".tif": ((0, b"II*\x00"), (0, b"MM\x00*")),
+            ".tiff": ((0, b"II*\x00"), (0, b"MM\x00*")),
+            ".webp": ((0, b"RIFF"), (8, b"WEBP")),
+            ".flac": ((0, b"fLaC"),),
+            ".ogg": ((0, b"OggS"),),
+            ".wav": ((0, b"RIFF"), (8, b"WAVE")),
+            ".zip": ((0, b"PK\x03\x04"), (0, b"PK\x05\x06"), (0, b"PK\x07\x08")),
+            ".7z": ((0, b"7z\xbc\xaf\x27\x1c"),),
+            ".rar": ((0, b"Rar!"),),
+            ".gz": ((0, b"\x1f\x8b"),),
+            ".bz2": ((0, b"BZh"),),
+            ".xz": ((0, b"\xfd7zXZ\x00"),),
+            ".exe": ((0, b"MZ"),),
+            ".dll": ((0, b"MZ"),),
+            ".sys": ((0, b"MZ"),),
+            ".elf": ((0, b"\x7fELF"),),
+            ".sprx": ((0, b"\x7fELF"),),
+        }
+
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return False, f"stat failed: {exc}"
+
+        if size == 0:
+            return True, "empty file"
+
+        ext = path.suffix.lower()
+        checks = known_signatures.get(ext, ())
+        try:
+            with path.open("rb") as f:
+                header = f.read(64)
+        except OSError as exc:
+            return False, f"read failed: {exc}"
+
+        if checks:
+            for offset, expected in checks:
+                end = offset + len(expected)
+                if len(header) < end or header[offset:end] != expected:
+                    return False, (
+                        f"invalid {ext} header: got={header[:32].hex()} "
+                        f"expected={expected.hex()} at offset {offset}"
+                    )
+
+        digest = hashlib.sha256()
+        first_byte: int | None = None
+        uniform = True
+        try:
+            with path.open("rb") as f:
+                while True:
+                    chunk = f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if first_byte is None:
+                        first_byte = chunk[0]
+                    if uniform and any(value != first_byte for value in chunk):
+                        uniform = False
+        except OSError as exc:
+            return False, f"read failed during byte scan: {exc}"
+
+        if uniform and size >= 4096:
+            value = first_byte if first_byte is not None else 0
+            return False, (
+                f"uniform-byte corruption: {size:,} bytes are all 0x{value:02X}; "
+                f"sha256={digest.hexdigest()}"
+            )
+
+        return True, f"{human_bytes(size)}, sha256={digest.hexdigest()}"
+
+    def _invalid_download_files(
+        self, root: Path
+    ) -> tuple[list[tuple[Path, str]], int, int]:
+        """Verify every installed file and return only the files that fail."""
+        invalid: list[tuple[Path, str]] = []
+        file_count = 0
+        total_size = 0
         if not root.is_dir():
-            return invalid
-        expected = b"TAff0000"
+            return invalid, file_count, total_size
+
         try:
             for base, _dirs, files in os.walk(root):
                 for name in files:
-                    if not name.lower().endswith(".ff"):
-                        continue
                     path = Path(base) / name
+                    file_count += 1
                     try:
-                        with path.open("rb") as f:
-                            header = f.read(len(expected))
+                        total_size += path.stat().st_size
                     except OSError:
-                        invalid.append((path, b""))
-                        continue
-                    if header != expected:
-                        invalid.append((path, header))
+                        pass
+                    ok, reason = self._verify_file_bytes(path)
+                    if not ok:
+                        invalid.append((path, reason))
         except OSError as exc:
-            self.emit("log", f"Could not scan Workshop fastfiles: {exc}")
-        return invalid
+            invalid.append((root, f"directory scan failed: {exc}"))
 
-    def _repair_invalid_bo3_fastfiles(
-        self, item_id: str, invalid: list[tuple[Path, bytes]]
+        return invalid, file_count, total_size
+
+    def _repair_invalid_download_files(
+        self,
+        item_id: str,
+        installed: Path,
+        invalid: list[tuple[Path, str]],
     ) -> int:
-        """Remove only invalid installed .ff files so SteamCMD is forced to redownload them."""
+        """Remove only failed files from installed/partial data for targeted redownload."""
         removed = 0
-        for path, header in invalid:
+        partial = self.partial_root / item_id
+
+        for path, reason in invalid:
             try:
-                if path.is_file():
-                    path.unlink()
-                    removed += 1
-                    self._log(
-                        item_id,
-                        f"INVALID FASTFILE REMOVED: {path} header={header.hex() or 'unreadable'}",
-                    )
-                    self.emit(
-                        "log",
-                        f"Integrity repair: removed invalid fastfile {path} "
-                        f"(header {header.hex() or 'unreadable'}; expected 5441666630303030).",
-                    )
-            except OSError as exc:
-                raise RuntimeError(f"Could not remove invalid fastfile {path}: {exc}") from exc
+                relative = path.relative_to(installed)
+            except ValueError:
+                relative = None
+
+            targets = [path]
+            if relative is not None:
+                targets.append(partial / relative)
+
+            removed_any = False
+            for target in targets:
+                if not target.is_file():
+                    continue
+                try:
+                    target.unlink()
+                    if target.exists():
+                        raise RuntimeError(f"file still exists after delete: {target}")
+                except OSError as exc:
+                    raise RuntimeError(f"Could not remove invalid file {target}: {exc}") from exc
+                removed += 1
+                removed_any = True
+                self._log(item_id, f"INVALID FILE REMOVED: {target} reason={reason}")
+                self.emit("log", f"Integrity repair: removed invalid file {target} ({reason}).")
+
+            if not removed_any:
+                self.emit("log", f"Integrity repair: invalid file no longer exists: {path} ({reason})")
+
         return removed
 
-    def verify_completed(self, item: ItemInfo, installed: Path) -> tuple[bool, str]:
-        """Perform cheap post-download integrity checks before declaring success."""
+    def verify_completed(
+        self, item: ItemInfo, installed: Path
+    ) -> tuple[bool, str, list[tuple[Path, str]]]:
+        """Run SteamCMD-success checks plus a full per-file byte integrity scan."""
         if not installed.is_dir():
-            return False, "SteamCMD reported success, but the installed Workshop directory is missing."
+            return (
+                False,
+                "SteamCMD reported success, but the installed Workshop directory is missing.",
+                [],
+            )
 
         size = sum_tree_bytes(installed)
         if size <= 0:
-            return False, "SteamCMD reported success, but the installed Workshop directory is empty."
+            return (
+                False,
+                "SteamCMD reported success, but the installed Workshop directory is empty.",
+                [],
+            )
 
-        file_count = 0
-        try:
-            for _base, _dirs, files in os.walk(installed):
-                file_count += len(files)
-        except OSError as exc:
-            return False, f"Could not inspect the installed Workshop directory: {exc}"
+        self.emit("status", "Running per-file integrity verification…")
+        invalid_files, file_count, scanned_size = self._invalid_download_files(installed)
 
         if file_count == 0:
-            return False, "SteamCMD reported success, but no installed Workshop files were found."
-
-        invalid_fastfiles = self._invalid_bo3_fastfiles(installed)
-        if invalid_fastfiles:
-            details = ", ".join(
-                f"{path.name}={header.hex() or 'unreadable'}"
-                for path, header in invalid_fastfiles[:5]
+            return (
+                False,
+                "SteamCMD reported success, but no installed Workshop files were found.",
+                [],
             )
-            extra = "" if len(invalid_fastfiles) <= 5 else f" (+{len(invalid_fastfiles) - 5} more)"
-            return False, (
-                "SteamCMD reported success, but the installed Workshop data contains "
-                f"{len(invalid_fastfiles)} invalid BO3 fastfile(s): {details}{extra}"
+
+        if invalid_files:
+            details = ", ".join(
+                f"{path.name}: {reason}"
+                for path, reason in invalid_files[:5]
+            )
+            extra = "" if len(invalid_files) <= 5 else f" (+{len(invalid_files) - 5} more)"
+            return (
+                False,
+                "Per-file integrity verification failed: "
+                f"{len(invalid_files)} of {file_count:,} file(s) are invalid: {details}{extra}",
+                invalid_files,
             )
 
         if item.size and item.size_source != "Workshop webpage (theoretical)":
-            ratio = size / item.size
+            ratio = scanned_size / item.size
             if ratio < 0.95 or ratio > 1.05:
                 self.emit(
                     "log",
-                    f"Integrity warning: installed size {human_bytes(size)} differs "
+                    f"Integrity warning: installed size {human_bytes(scanned_size)} differs "
                     f"from Steam's reported {human_bytes(item.size)} ({ratio * 100:.1f}%)."
                 )
 
@@ -843,7 +961,11 @@ class Engine:
             if item.size_source != "unknown"
             else ""
         )
-        return True, f"Verified {file_count:,} file(s), {human_bytes(size)} on disk{source_note}"
+        return (
+            True,
+            f"Verified {file_count:,} file(s) / {human_bytes(scanned_size)} with full byte scan{source_note}",
+            [],
+        )
 
     def export(self, item: ItemInfo) -> Path:
         src = self.installed_root / item.item_id
@@ -1186,18 +1308,19 @@ class Engine:
 
             if SUCCESS_RE.search(text):
                 installed = self.installed_root / item.item_id
-                verified, verification_msg = self.verify_completed(item, installed)
+                verified, verification_msg, invalid_files = self.verify_completed(item, installed)
                 if not verified:
                     self.emit("status", verification_msg + " Repairing invalid files and retrying.")
                     self._log(item.item_id, "INTEGRITY CHECK FAILED: " + verification_msg)
-                    invalid_fastfiles = self._invalid_bo3_fastfiles(installed)
-                    if invalid_fastfiles:
+                    if invalid_files:
                         try:
-                            removed = self._repair_invalid_bo3_fastfiles(item.item_id, invalid_fastfiles)
+                            removed = self._repair_invalid_download_files(
+                                item.item_id, installed, invalid_files
+                            )
                             self.emit(
                                 "status",
-                                f"Integrity repair removed {removed} invalid fastfile(s); "
-                                "SteamCMD will redownload them. Other Workshop data is preserved."
+                                f"Integrity repair removed {removed} invalid file copy/copies; "
+                                "SteamCMD will redownload only those files. Other Workshop data is preserved."
                             )
                         except Exception as exc:
                             self._log(item.item_id, f"INTEGRITY REPAIR FAILED: {exc}")
