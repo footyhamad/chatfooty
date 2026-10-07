@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "2026-10-07-per-file-integrity-scan"
+BUILD_REVISION = "2026-10-07-per-file-integrity-scan-version-check"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -1483,8 +1483,10 @@ class App:
         ttk.Label(config, text="Output folder").grid(row=2, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(config, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(config, text="Browse", command=self.browse_output).grid(row=2, column=2, padx=6)
+        self.version_btn = ttk.Button(config, text="CHECK VERSION", command=self.check_version)
+        self.version_btn.grid(row=0, column=3, padx=(14, 6), sticky="ew")
         self.update_btn = ttk.Button(config, text="CHECK FOR UPDATE", command=self.update_app)
-        self.update_btn.grid(row=0, column=3, rowspan=3, padx=(14, 6), sticky="ns")
+        self.update_btn.grid(row=1, column=3, padx=(14, 6), sticky="ew")
         ttk.Checkbutton(
             config, text="Dark mode", variable=self.dark_mode_var, command=self.apply_theme,
         ).grid(row=3, column=1, sticky="w", padx=6, pady=(3, 5))
@@ -1552,6 +1554,12 @@ class App:
         self.log_menu = Menu(self.root, tearoff=False)
         self.log_menu.add_command(label="Copy", command=self.copy_log)
         self.log_menu.add_command(label="Select All", command=self.select_all_log)
+
+    def check_version(self):
+        """Show the installed downloader version without changing anything."""
+        version = BUILD_REVISION
+        self.status_var.set(f"Version: {version}")
+        self.add_log(f"VERSION CHECK: installed downloader revision = {version}")
 
     def update_app(self):
         """Download the latest source from GitHub and replace this file.
