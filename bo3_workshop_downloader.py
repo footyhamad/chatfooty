@@ -23,7 +23,7 @@ from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Men
 from tkinter import ttk
 
 APP_ID = "311210"
-BUILD_REVISION = "2026-10-07-per-file-integrity"
+BUILD_REVISION = "2026-10-07-per-file-integrity-scan"
 STEAM_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 DEFAULTS = {
     "steamcmd": "",
@@ -1495,6 +1495,8 @@ class App:
         ttk.Label(workshop, text="IDs / Workshop URLs").grid(row=0, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(workshop, textvariable=self.ids_var).grid(row=0, column=1, sticky="ew", padx=6, pady=5)
         ttk.Button(workshop, text="Lookup", command=self.lookup).grid(row=0, column=2, padx=6)
+        self.scan_btn = ttk.Button(workshop, text="SCAN & REPAIR", command=self.scan_and_repair)
+        self.scan_btn.grid(row=1, column=0, padx=6, pady=5, sticky="w")
         self.start_btn = ttk.Button(workshop, text="START / RESUME", command=self.start)
         self.start_btn.grid(row=1, column=1, sticky="w", padx=6, pady=5)
         self.clear_btn = ttk.Button(workshop, text="CLEAR & FRESH", command=self.clear_old_data)
@@ -1926,6 +1928,147 @@ class App:
             self.engine.stop()
         self.status_var.set("Stopping… partial data will be preserved")
 
+    def scan_and_repair(self):
+        """Scan existing Workshop installs and redownload only files that fail integrity checks."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Scan & repair", "Stop the current download before scanning.")
+            return
+
+        steamcmd = Path(self.steamcmd_var.get().strip().strip('"'))
+        user = self.user_var.get().strip() or detect_steam_user(steamcmd)
+        ids = self.ids()
+        if not steamcmd.is_file():
+            messagebox.showerror("SteamCMD", "Select the SteamCMD executable first.")
+            return
+        if not user:
+            messagebox.showerror(
+                "Steam login",
+                "No cached login found. Log in once manually with this SteamCMD install.",
+            )
+            return
+        if not ids:
+            messagebox.showerror("Workshop", "Enter at least one numeric Workshop ID.")
+            return
+
+        # This operation never clears a whole map and never exports it again.
+        # It only removes files that our verifier identifies as corrupt, then
+        # lets SteamCMD validate/redownload the missing files.
+        self.save()
+        self.log_box.delete(*self.log_box.get_children())
+        self.bar.configure(value=0)
+        self.progress_var.set("Scan: 0 B")
+        self.speed_var.set("Download: 0 B/s")
+        self.disk_speed_var.set("Disk write: 0 B/s")
+        self.eta_var.set("ETA --:--")
+        self.status_var.set("Scanning existing Workshop data…")
+        self.start_btn.configure(state="disabled")
+        self.clear_btn.configure(state="disabled")
+        self.scan_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        engine = Engine(
+            steamcmd,
+            user,
+            Path(self.output_var.get().strip().strip('"') or "BO3-Workshop"),
+            retries=int(self.retry_var.get() or 0),
+            watchdog=int(self.watchdog_var.get() or 420),
+            stall_seconds=max(30, int(self.stall_var.get() or 75)),
+            poll=1.0,
+            auto_export=False,
+            retry_backoff_seconds=5,
+            max_throughput=self.max_throughput_var.get(),
+            emit=lambda kind, payload: self.events.put((kind, payload)),
+        )
+        self.engine = engine
+
+        def work():
+            try:
+                repaired_maps = 0
+                for iid in ids:
+                    if engine.stop_event.is_set():
+                        break
+
+                    installed = engine.installed_root / iid
+                    self.events.put(("status", f"Scanning Workshop map {iid}…"))
+                    self.events.put(("log", f"=== SCAN & REPAIR [{iid}] ==="))
+                    self.events.put(("log", f"INSTALLED PATH: {installed}"))
+
+                    item = ItemInfo(item_id=iid)
+                    if not installed.is_dir():
+                        self.events.put((
+                            "log",
+                            f"SCAN: map {iid} is not installed; nothing to repair.",
+                        ))
+                        self.events.put((
+                            "finished",
+                            (False, f"{iid}: installed Workshop directory not found."),
+                        ))
+                        continue
+
+                    verified, message, invalid_files = engine.verify_completed(item, installed)
+                    self.events.put(("log", f"SCAN RESULT: {message}"))
+
+                    if verified:
+                        self.events.put(("finished", (True, f"{iid}: already clean; no redownload needed.")))
+                        continue
+
+                    if not invalid_files:
+                        self.events.put((
+                            "finished",
+                            (False, f"{iid}: scan failed without identifying individual files; no files were deleted."),
+                        ))
+                        continue
+
+                    self.events.put((
+                        "status",
+                        f"{iid}: found {len(invalid_files)} bad file(s); removing only those and redownloading…",
+                    ))
+                    removed = engine._repair_invalid_download_files(iid, installed, invalid_files)
+                    self.events.put((
+                        "log",
+                        f"REPAIR: removed {removed} bad file copy/copies from {iid}; other files preserved.",
+                    ))
+
+                    # SteamCMD is now asked to validate the existing item. Because
+                    # only failed files were removed, it has an opportunity to
+                    # redownload those files instead of starting the map from zero.
+                    engine.stop_event.clear()
+                    repaired_maps += 1
+                    result = engine.download(item, require_empty_start=False)
+                    if result is None:
+                        self.events.put(("finished", (False, f"{iid}: repair download failed.")))
+                        continue
+
+                    verified_again, message_again, invalid_again = engine.verify_completed(
+                        item, engine.installed_root / iid
+                    )
+                    if verified_again and not invalid_again:
+                        self.events.put(("finished", (True, f"{iid}: repaired successfully — {message_again}")))
+                    else:
+                        details = "; ".join(
+                            f"{p.name}: {reason}" for p, reason in invalid_again[:5]
+                        )
+                        self.events.put((
+                            "finished",
+                            (
+                                False,
+                                f"{iid}: repair completed but integrity still fails"
+                                + (f" — {details}" if details else f" — {message_again}")
+                            ),
+                        ))
+
+                if engine.stop_event.is_set():
+                    return
+                self.events.put(("status", f"Scan & repair complete: repaired {repaired_maps} map(s)."))
+            except Exception as exc:
+                self.events.put(("log", f"SCAN & REPAIR ERROR: {exc}"))
+                self.events.put(("finished", (False, f"Scan & repair failed: {exc}")))
+            finally:
+                self.events.put(("scan_done", None))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
     def copy_log(self, _event=None):
         selected = self.log_box.selection()
         if not selected:
@@ -2036,9 +2179,17 @@ class App:
                     self.status_var.set(str(msg) if ok else "Update failed")
                     if not ok:
                         messagebox.showerror("Update", str(msg))
+                elif kind == "scan_done":
+                    self.start_btn.configure(state="normal")
+                    self.clear_btn.configure(state="normal")
+                    self.scan_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    if not self.status_var.get().startswith("Scan & repair complete"):
+                        self.status_var.set("Scan & repair finished")
                 elif kind == "all_done":
                     self.start_btn.configure(state="normal")
                     self.clear_btn.configure(state="normal")
+                    self.scan_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                     if self.status_var.get().startswith("Preparing") or self.status_var.get().startswith("Downloading"):
                         self.status_var.set("Queue finished")
